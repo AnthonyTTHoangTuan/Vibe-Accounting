@@ -1,0 +1,1055 @@
+Option Explicit
+
+' ===== Global config =====
+Private Const TOL As Double = 0.01   ' tolerance for equality
+
+' -------- Bank columns (TIDY layout) --------
+' A: Date, B: Narrative, C: Debit, D: Credit, E: Running balance (from statement)
+' F: Credit minus Debit (created), G: Seq (created),
+' H: Matched Invoices (created), I: Note (created)
+Private Const COL_BANK_DATE As Long = 1
+Private Const COL_BANK_NARR As Long = 2
+Private Const COL_BANK_DEBIT As Long = 3
+Private Const COL_BANK_CREDIT As Long = 4
+Private Const COL_BANK_RUNBAL As Long = 5
+Private Const COL_BANK_AMT As Long = 6        ' Credit - Debit
+Private Const COL_BANK_SEQ As Long = 7        ' 1..N
+Private Const COL_BANK_MATCH As Long = 8      ' Matched Invoices (CSV)
+Private Const COL_BANK_NOTE As Long = 9       ' Notes
+
+' -------- Invoice columns (Yardi GL layout) --------
+' Date/Period/Debit/Credit: K/L/P/Q
+' Row 7 is header row, row 8 is first data row.
+' T: Debit minus Credit (created)
+' U: Seq, V: Tag, W: Note
+Private Const COL_INV_DATE As Long = 11       ' K
+Private Const COL_INV_PERIOD As Long = 12     ' L
+Private Const COL_INV_DEBIT As Long = 16      ' P
+Private Const COL_INV_CREDIT As Long = 17     ' Q
+Private Const COL_INV_AMT As Long = 20        ' T  (Debit - Credit)
+Private Const COL_INV_SEQ As Long = 21        ' U
+Private Const COL_INV_TAG As Long = 22        ' V
+Private Const COL_INV_NOTE As Long = 23       ' W
+Private Const INV_HEADER_ROW As Long = 7
+Private Const INV_FIRST_DATA_ROW As Long = INV_HEADER_ROW + 1 ' 8
+
+' -------- Note text constants --------
+Private Const NOTE_TIMING As String = "Invoice matching with timing difference"
+Private Const NOTE_MATCH_NO_TIMING As String = "Invoice matching without timing difference"
+Private Const NOTE_BANK_FEE As String = "Bank fee"
+Private Const NOTE_INFO_REQ As String = "Information request"
+
+' British accounting number format (2 decimals, commas, negatives in brackets)
+Private Const NF_ACCT As String = "_(* #,##0.00_);_(* (#,##0.00);_(* ""-""??_);_(@_)"
+Private Const NF_DATE As String = "yyyy-mm-dd"
+
+' ===== Types =====
+Private Type InvCand
+    Row As Long
+    amt As Currency    ' signed amount
+    Dt As Date
+    No As String       ' invoice display id
+End Type
+
+Private Type InvCandAbs
+    Row As Long
+    AmtAbs As Currency ' |Amt|
+    Dt As Date
+    No As String       ' invoice display id
+End Type
+
+' ===== Module state for DFS (aligned) =====
+Private mAbs() As InvCandAbs
+Private mTargetAbs As Currency
+Private mMaxK As Long
+Private mFound As Boolean
+Private mPickIdx() As Long
+Private mDepth As Long
+
+' ===== Module state for DFS (signed) =====
+Private mSigned() As InvCand
+Private mTargetSigned As Currency
+Private mPickIdxS() As Long
+Private mDepthS As Long
+Private mFoundS As Boolean
+
+' ==================================================
+' ENTRY POINT – run this macro
+' ==================================================
+Public Sub TidyAndReconcile()
+    Dim wsRawBank As Worksheet
+    Dim wsBank As Worksheet
+    Dim wsInv As Worksheet
+    
+    Dim wasScreen As Boolean
+    Dim wasCalc As XlCalculation
+    
+    If ActiveSheet Is Nothing Then
+        MsgBox "Please activate the raw NAB bank statement sheet and try again.", vbExclamation
+        Exit Sub
+    End If
+    
+    Set wsRawBank = ActiveSheet
+    
+    wasScreen = Application.ScreenUpdating
+    wasCalc = Application.Calculation
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    
+    ' 1) Tidy the raw NAB statement on the active sheet
+    TidyBankStatement wsRawBank, wsBank
+    
+    ' 2) Find the Yardi invoice sheet (GL)
+    Set wsInv = FindInvoiceSheet()
+    If wsInv Is Nothing Then
+        MsgBox "Could not find the Yardi invoice sheet (Date/Period/Debit/Credit in K/L/P/Q, header row 7).", vbExclamation
+        GoTo CleanExit
+    End If
+    
+    ' 3) Rename the Yardi invoice sheet: Yardi_<old name>
+    RenameInvoiceSheet wsInv
+    
+    ' 4) Reconcile tidy bank vs Yardi invoices
+    ReconcileBankToInvoices wsBank, wsInv
+    
+CleanExit:
+    Application.ScreenUpdating = wasScreen
+    Application.Calculation = wasCalc
+End Sub
+
+' ==================================================
+' =============  PART 1: Tidy NAB sheet  ===========
+' ==================================================
+
+' Helper: make safe sheet name
+Private Function CleanSheetName(ByVal s As String) As String
+    Dim badChars As Variant
+    Dim i As Long
+    
+    badChars = Array(":", "\", "/", "?", "*", "[", "]")
+    For i = LBound(badChars) To UBound(badChars)
+        s = Replace$(s, badChars(i), " ")
+    Next i
+    
+    s = Trim$(s)
+    If Len(s) = 0 Then s = "NAB_Tidy"
+    
+    'Excel sheet name max 31 chars
+    If Len(s) > 31 Then s = Left$(s, 31)
+    
+    CleanSheetName = s
+End Function
+
+' Helper: detect bank account name from header box (with BSB ###-###)
+Private Function GetBankAccountName(ws As Worksheet) As String
+    Dim c As Range
+    Dim txt As String
+    Dim lines() As String
+    
+    For Each c In ws.UsedRange
+        txt = CStr(c.Value)
+        If InStr(txt, "-") > 0 Then
+            'look for BSB pattern ###-###
+            If txt Like "*###-###*" Then
+                'usually "Account name" in first line,
+                'BSB+Account in second line
+                lines = Split(txt, vbLf)
+                If UBound(lines) >= 0 Then
+                    GetBankAccountName = CleanSheetName(Trim$(lines(0)))
+                Else
+                    GetBankAccountName = CleanSheetName(Trim$(txt))
+                End If
+                Exit Function
+            End If
+        End If
+    Next c
+    
+    'fallback
+    GetBankAccountName = "NAB_Tidy"
+End Function
+
+' Tidy the raw NAB sheet into a flat table
+'   A: Date, B: NarrativeType, C: Debit, D: Credit, E: RunningBalance
+Private Sub TidyBankStatement(wsSrc As Worksheet, ByRef wsBankOut As Worksheet)
+    Const TMP_NAME As String = "NAB_Tidy"
+    
+    Dim wsOut As Worksheet
+    Dim lastRow As Long
+    Dim r As Long, c As Long, c2 As Long, maxCol As Long
+    Dim isHeader As Boolean
+    Dim dateCol As Long, narrCol As Long, debitCol As Long, creditCol As Long, balanceCol As Long
+    Dim cellVal As String
+    Dim outRow As Long
+    Dim cellDate As Variant
+    Dim narrText As String, finalNarr As String
+    Dim hasNarr As Boolean, hasDebit As Boolean, hasCredit As Boolean
+    Dim typeBuffer As String
+    
+    On Error Resume Next
+    lastRow = wsSrc.Cells.Find(What:="*", After:=wsSrc.Range("A1"), _
+                               SearchOrder:=xlByRows, SearchDirection:=xlPrevious).Row
+    On Error GoTo 0
+    If lastRow = 0 Then
+        MsgBox "No data found on raw bank sheet.", vbExclamation
+        Exit Sub
+    End If
+    
+    On Error Resume Next
+    Set wsOut = ThisWorkbook.Worksheets(TMP_NAME)
+    On Error GoTo 0
+    
+    If wsOut Is Nothing Then
+        Set wsOut = ThisWorkbook.Worksheets.Add(After:=wsSrc)
+        wsOut.name = TMP_NAME
+    Else
+        wsOut.Cells.Clear
+    End If
+    
+    wsOut.Range("A1:E1").Value = Array("Date", "NarrativeType", "Debit", "Credit", "RunningBalance")
+    outRow = 1
+    
+    dateCol = 0: narrCol = 0: debitCol = 0: creditCol = 0: balanceCol = 0
+    typeBuffer = vbNullString
+    
+    For r = 1 To lastRow
+        
+        isHeader = False
+        maxCol = wsSrc.Cells(r, wsSrc.Columns.Count).End(xlToLeft).Column
+        
+        ' detect header rows containing "Date"
+        For c = 1 To maxCol
+            cellVal = Trim$(CStr(wsSrc.Cells(r, c).Value))
+            If StrComp(cellVal, "Date", vbTextCompare) = 0 Then
+                
+                isHeader = True
+                dateCol = c
+                narrCol = 0: debitCol = 0: creditCol = 0: balanceCol = 0
+                
+                ' find Narrative / Debit / Credit / Running balance on same row
+                For c2 = 1 To maxCol
+                    cellVal = wsSrc.Cells(r, c2).Text
+                    cellVal = Replace(cellVal, vbLf, " ")
+                    cellVal = Trim$(cellVal)
+                    
+                    If InStr(1, cellVal, "Narrative", vbTextCompare) > 0 Then
+                        narrCol = c2
+                    ElseIf StrComp(cellVal, "Debit", vbTextCompare) = 0 Then
+                        debitCol = c2
+                    ElseIf StrComp(cellVal, "Credit", vbTextCompare) = 0 Then
+                        creditCol = c2
+                    ElseIf InStr(1, cellVal, "Running balance", vbTextCompare) > 0 Then
+                        balanceCol = c2
+                    End If
+                Next c2
+                
+                typeBuffer = vbNullString
+                Exit For
+            End If
+        Next c
+        
+        If isHeader Then GoTo NextRow
+        
+        If dateCol = 0 Or narrCol = 0 Then GoTo NextRow
+        
+        ' classify row
+        cellDate = wsSrc.Cells(r, dateCol).Value
+        narrText = CStr(wsSrc.Cells(r, narrCol).Value)
+        hasNarr = (Len(Trim$(narrText)) > 0)
+        
+        hasDebit = False
+        hasCredit = False
+        If debitCol > 0 Then
+            hasDebit = (Len(Trim$(CStr(wsSrc.Cells(r, debitCol).Value))) > 0)
+        End If
+        If creditCol > 0 Then
+            hasCredit = (Len(Trim$(CStr(wsSrc.Cells(r, creditCol).Value))) > 0)
+        End If
+        
+        ' normal transaction row (has Date)
+        If IsDate(cellDate) Then
+            
+            outRow = outRow + 1
+            wsOut.Cells(outRow, 1).Value = CDate(cellDate)
+            
+            finalNarr = narrText
+            If Len(typeBuffer) > 0 Then
+                If Len(Trim$(finalNarr)) > 0 Then
+                    finalNarr = finalNarr & vbLf & typeBuffer
+                Else
+                    finalNarr = typeBuffer
+                End If
+            End If
+            typeBuffer = vbNullString
+            
+            wsOut.Cells(outRow, 2).Value = finalNarr
+            If debitCol > 0 Then wsOut.Cells(outRow, 3).Value = wsSrc.Cells(r, debitCol).Value
+            If creditCol > 0 Then wsOut.Cells(outRow, 4).Value = wsSrc.Cells(r, creditCol).Value
+            If balanceCol > 0 Then wsOut.Cells(outRow, 5).Value = wsSrc.Cells(r, balanceCol).Text
+        
+        ' stray narrative row directly above first date
+        ElseIf hasNarr And (Not hasDebit) And (Not hasCredit) _
+               And r < lastRow _
+               And IsDate(wsSrc.Cells(r + 1, dateCol).Value) Then
+            
+            If Len(typeBuffer) = 0 Then
+                typeBuffer = narrText
+            Else
+                typeBuffer = typeBuffer & vbLf & narrText
+            End If
+        
+        End If
+        
+NextRow:
+    Next r
+    
+    With wsOut
+        .Columns("A").NumberFormat = NF_DATE
+        .Columns("C:D").NumberFormat = NF_ACCT
+        .Columns("A:E").EntireColumn.AutoFit
+        .Columns("A:E").WrapText = True
+    End With
+    
+    Dim acctName As String
+    acctName = GetBankAccountName(wsSrc)
+    On Error Resume Next
+    wsOut.name = acctName
+    On Error GoTo 0
+    
+    Set wsBankOut = wsOut
+End Sub
+
+' ==================================================
+' =======  PART 2: Locate & rename Yardi sheet  ====
+' ==================================================
+
+' Find Yardi invoice sheet by looking for Date/Period/Debit/Credit in row 7, cols K/L/P/Q
+Private Function FindInvoiceSheet() As Worksheet
+    Dim ws As Worksheet
+    
+    For Each ws In ThisWorkbook.Worksheets
+        If LCase$(CStr(ws.Cells(INV_HEADER_ROW, COL_INV_DATE).Value)) = "date" _
+           And LCase$(CStr(ws.Cells(INV_HEADER_ROW, COL_INV_PERIOD).Value)) = "period" _
+           And LCase$(CStr(ws.Cells(INV_HEADER_ROW, COL_INV_DEBIT).Value)) = "debit" _
+           And LCase$(CStr(ws.Cells(INV_HEADER_ROW, COL_INV_CREDIT).Value)) = "credit" Then
+            Set FindInvoiceSheet = ws
+            Exit Function
+        End If
+    Next ws
+    
+    ' fallback: sheet literally called "Report1"
+    On Error Resume Next
+    Set FindInvoiceSheet = ThisWorkbook.Worksheets("Report1")
+    On Error GoTo 0
+End Function
+
+' Rename invoice sheet to "Yardi_<old name>"
+Private Sub RenameInvoiceSheet(wsInv As Worksheet)
+    Dim newName As String
+    newName = "Yardi_" & wsInv.name
+    newName = CleanSheetName(newName)
+    On Error Resume Next
+    wsInv.name = newName
+    On Error GoTo 0
+End Sub
+
+' ==================================================
+' ============  PART 3: Reconciliation  ============
+' ==================================================
+
+Private Sub ReconcileBankToInvoices(wsBank As Worksheet, wsInv As Worksheet)
+    Dim wsOut As Worksheet
+    Dim lastBankRow As Long, lastInvRow As Long
+    
+    Set wsOut = EnsureSheetAfter(wsInv, "Result")
+    
+    wsBank.Columns(COL_BANK_DATE).NumberFormat = NF_DATE
+    wsInv.Columns(COL_INV_DATE).NumberFormat = NF_DATE
+    wsInv.Columns(COL_INV_PERIOD).NumberFormat = NF_DATE
+    
+    PrepareBankSheet wsBank
+    PrepareInvoiceSheet wsInv
+    
+    lastBankRow = wsBank.Cells(wsBank.rows.Count, COL_BANK_DATE).End(xlUp).Row
+    lastInvRow = wsInv.Cells(wsInv.rows.Count, COL_INV_DATE).End(xlUp).Row
+    
+    If lastInvRow >= INV_FIRST_DATA_ROW Then
+        wsInv.Range(wsInv.Cells(INV_FIRST_DATA_ROW, COL_INV_TAG), _
+                    wsInv.Cells(lastInvRow, COL_INV_TAG)).ClearContents
+        wsInv.Range(wsInv.Cells(INV_FIRST_DATA_ROW, COL_INV_NOTE), _
+                    wsInv.Cells(lastInvRow, COL_INV_NOTE)).ClearContents
+    End If
+    If lastBankRow >= 2 Then
+        wsBank.Range(wsBank.Cells(2, COL_BANK_MATCH), wsBank.Cells(lastBankRow, COL_BANK_MATCH)).ClearContents
+        wsBank.Range(wsBank.Cells(2, COL_BANK_NOTE), wsBank.Cells(lastBankRow, COL_BANK_NOTE)).ClearContents
+    End If
+    
+    FirstPassMatch wsBank, wsInv
+    FinalPassOnUnmatched wsBank, wsInv
+    AnnotateUnmatchedBankNotes wsBank
+    BuildResultSheet wsBank, wsInv, wsOut
+    PostFormatSheets wsBank, wsInv
+End Sub
+
+' ==================================================
+' Prepare sheets (computed columns & seq)
+' ==================================================
+Private Sub PrepareBankSheet(ws As Worksheet)
+    Dim lastRow As Long, r As Long
+    lastRow = ws.Cells(ws.rows.Count, COL_BANK_DATE).End(xlUp).Row
+    If lastRow < 2 Then Exit Sub
+    
+    ws.Cells(1, COL_BANK_AMT).Value = "Credit minus Debit"
+    ws.Cells(1, COL_BANK_SEQ).Value = "Seq"
+    ws.Cells(1, COL_BANK_MATCH).Value = "Matched Invoices"
+    ws.Cells(1, COL_BANK_NOTE).Value = "Note"
+    
+    For r = 2 To lastRow
+        If IsDate(ws.Cells(r, COL_BANK_DATE).Value) Or _
+           Len(Trim$(CStr(ws.Cells(r, COL_BANK_NARR).Value))) > 0 Or _
+           Len(Trim$(CStr(ws.Cells(r, COL_BANK_DEBIT).Value))) > 0 Or _
+           Len(Trim$(CStr(ws.Cells(r, COL_BANK_CREDIT).Value))) > 0 Then
+            ws.Cells(r, COL_BANK_AMT).Value = _
+                CCur(Round(CCur(Nz(ws.Cells(r, COL_BANK_CREDIT).Value)) - _
+                          CCur(Nz(ws.Cells(r, COL_BANK_DEBIT).Value)), 2))
+            ws.Cells(r, COL_BANK_SEQ).Value = r - 1
+        End If
+    Next r
+End Sub
+
+Private Sub PrepareInvoiceSheet(ws As Worksheet)
+    Dim lastRow As Long, r As Long
+    lastRow = ws.Cells(ws.rows.Count, COL_INV_DATE).End(xlUp).Row
+    If lastRow < INV_FIRST_DATA_ROW Then Exit Sub
+    
+    ' headers on row 7
+    ws.Cells(INV_HEADER_ROW, COL_INV_AMT).Value = "Debit minus Credit"
+    ws.Cells(INV_HEADER_ROW, COL_INV_SEQ).Value = "Seq"
+    ws.Cells(INV_HEADER_ROW, COL_INV_TAG).Value = "Tag"
+    ws.Cells(INV_HEADER_ROW, COL_INV_NOTE).Value = "Note"
+    
+    For r = INV_FIRST_DATA_ROW To lastRow
+        If IsDate(ws.Cells(r, COL_INV_DATE).Value) Or _
+           Len(Trim$(CStr(ws.Cells(r, COL_INV_PERIOD).Value))) > 0 Or _
+           Len(Trim$(CStr(ws.Cells(r, COL_INV_DEBIT).Value))) > 0 Or _
+           Len(Trim$(CStr(ws.Cells(r, COL_INV_CREDIT).Value))) > 0 Then
+            ws.Cells(r, COL_INV_AMT).Value = _
+                CCur(Round(CCur(Nz(ws.Cells(r, COL_INV_DEBIT).Value)) - _
+                          CCur(Nz(ws.Cells(r, COL_INV_CREDIT).Value)), 2))
+            ws.Cells(r, COL_INV_SEQ).Value = r - INV_HEADER_ROW
+        End If
+    Next r
+End Sub
+
+Private Function Nz(v As Variant) As Double
+    If IsError(v) Then
+        Nz = 0
+    ElseIf Trim$(CStr(v)) = vbNullString Then
+        Nz = 0
+    Else
+        Nz = CDbl(v)
+    End If
+End Function
+
+' ==================================================
+' Pass 1: main matching search with tolerance safeguard
+' ==================================================
+Private Sub FirstPassMatch(wsBank As Worksheet, wsInv As Worksheet)
+    Dim lastBankRow As Long, lastInvRow As Long
+    Dim i As Long, ok As Boolean
+    Dim bankDt As Date, bankAmt As Currency, bankId As String
+    Dim picks() As Long, sumInv As Currency, invList As String, diff As Currency
+    
+    lastBankRow = wsBank.Cells(wsBank.rows.Count, COL_BANK_DATE).End(xlUp).Row
+    lastInvRow = wsInv.Cells(wsInv.rows.Count, COL_INV_DATE).End(xlUp).Row
+    
+    For i = 2 To lastBankRow
+        If Not IsPracticalBankRow(wsBank, i) Then GoTo NextBank
+        If Not IsDate(wsBank.Cells(i, COL_BANK_DATE).Value) Then GoTo NextBank
+        
+        bankDt = DateValue(wsBank.Cells(i, COL_BANK_DATE).Value)
+        bankAmt = CCur(Round(CCur(wsBank.Cells(i, COL_BANK_AMT).Value), 2))
+        If bankAmt = 0 Then GoTo NextBank
+        
+        bankId = "BANK-" & CStr(wsBank.Cells(i, COL_BANK_SEQ).Value)
+        
+        ok = TryMatchForDate(wsInv, lastInvRow, bankDt, bankAmt, True, True, _
+                             12, picks, sumInv, invList)
+        If ok Then GoTo VerifyWrite
+        
+        ok = TryMatchForDate(wsInv, lastInvRow, bankDt, bankAmt, True, False, _
+                             8, picks, sumInv, invList)
+        If ok Then GoTo VerifyWrite
+        
+        ok = TryMatchForDate(wsInv, lastInvRow, bankDt, bankAmt, False, True, _
+                             8, picks, sumInv, invList)
+        If ok Then GoTo VerifyWrite
+        
+        ok = TryMatchForDate(wsInv, lastInvRow, bankDt, bankAmt, False, False, _
+                             6, picks, sumInv, invList)
+        If ok Then GoTo VerifyWrite
+        
+        GoTo NextBank
+        
+VerifyWrite:
+        diff = bankAmt - sumInv
+        If Abs(CDbl(diff)) <= TOL Then
+            ApplyMatch wsInv, wsBank, i, bankId, picks
+        End If
+NextBank:
+    Next i
+End Sub
+
+Private Function IsPracticalBankRow(ws As Worksheet, ByVal r As Long) As Boolean
+    IsPracticalBankRow = _
+        (IsDate(ws.Cells(r, COL_BANK_DATE).Value) Or _
+         Len(Trim$(CStr(ws.Cells(r, COL_BANK_NARR).Value))) > 0 Or _
+         Trim$(CStr(ws.Cells(r, COL_BANK_DEBIT).Value)) <> vbNullString Or _
+         Trim$(CStr(ws.Cells(r, COL_BANK_CREDIT).Value)) <> vbNullString)
+End Function
+
+' ==================================================
+' FINAL PASS (unmatched-only)
+' ==================================================
+Private Sub FinalPassOnUnmatched(wsBank As Worksheet, wsInv As Worksheet)
+    Dim lastBankRow As Long, lastInvRow As Long
+    Dim r As Long
+    
+    lastBankRow = wsBank.Cells(wsBank.rows.Count, COL_BANK_DATE).End(xlUp).Row
+    lastInvRow = wsInv.Cells(wsInv.rows.Count, COL_INV_DATE).End(xlUp).Row
+    
+    Dim invByDate As Object: Set invByDate = CreateObject("Scripting.Dictionary")
+    Dim d As Date, key As String
+    
+    For r = INV_FIRST_DATA_ROW To lastInvRow
+        If Len(Trim$(CStr(wsInv.Cells(r, COL_INV_TAG).Value))) = 0 Then
+            If IsDate(wsInv.Cells(r, COL_INV_DATE).Value) Then
+                d = DateValue(wsInv.Cells(r, COL_INV_DATE).Value)
+                key = Format$(d, "yyyymmdd")
+                If Not invByDate.Exists(key) Then invByDate.Add key, New Collection
+                invByDate(key).Add r
+            End If
+        End If
+    Next r
+    
+    For r = 2 To lastBankRow
+        If Len(Trim$(CStr(wsBank.Cells(r, COL_BANK_MATCH).Value))) = 0 _
+           And IsDate(wsBank.Cells(r, COL_BANK_DATE).Value) Then
+            
+            Dim bankDt As Date, bankAmt As Currency, bankId As String
+            bankDt = DateValue(wsBank.Cells(r, COL_BANK_DATE).Value)
+            bankAmt = CCur(Round(CCur(wsBank.Cells(r, COL_BANK_AMT).Value), 2))
+            If bankAmt = 0 Then GoTo NextBankRow
+            
+            bankId = "BANK-" & CStr(wsBank.Cells(r, COL_BANK_SEQ).Value)
+            
+            key = Format$(bankDt, "yyyymmdd")
+            If invByDate.Exists(key) Then
+                Dim rowsColl As Collection
+                Set rowsColl = invByDate(key)
+                If rowsColl.Count > 0 Then
+                    Dim total As Currency, j As Long, rr As Long, a As Currency
+                    total = 0
+                    For j = 1 To rowsColl.Count
+                        rr = rowsColl(j)
+                        a = CCur(Round(CCur(wsInv.Cells(rr, COL_INV_AMT).Value), 2))
+                        total = total + a
+                    Next j
+                    If Abs(CDbl(total - bankAmt)) <= TOL Then
+                        Dim picksAll() As Long
+                        ReDim picksAll(1 To rowsColl.Count)
+                        For j = 1 To rowsColl.Count: picksAll(j) = rowsColl(j): Next j
+                        ApplyMatch wsInv, wsBank, r, bankId, picksAll
+                        RemoveRowsFromCollection rowsColl, picksAll
+                        GoTo NextBankRow
+                    End If
+                    
+                    Dim picks() As Long, sumInv As Currency, invList As String, ok As Boolean
+                    Dim Kmax As Long: Kmax = rowsColl.Count
+                    
+                    ok = TryMatchWithinRows(wsInv, rowsColl, bankAmt, True, True, _
+                                            Kmax, picks, sumInv, invList)
+                    If Not ok Then
+                        ok = TryMatchWithinRows(wsInv, rowsColl, bankAmt, True, False, _
+                                                Kmax, picks, sumInv, invList)
+                    End If
+                    
+                    If ok Then
+                        If Abs(CDbl(sumInv - bankAmt)) <= TOL Then
+                            ApplyMatch wsInv, wsBank, r, bankId, picks
+                            RemoveRowsFromCollection rowsColl, picks
+                        End If
+                    End If
+                End If
+            End If
+        End If
+NextBankRow:
+    Next r
+End Sub
+
+Private Sub RemoveRowsFromCollection(ByRef coll As Collection, ByRef rows() As Long)
+    Dim i As Long, j As Long
+    For i = LBound(rows) To UBound(rows)
+        For j = coll.Count To 1 Step -1
+            If coll(j) = rows(i) Then
+                coll.Remove j
+                Exit For
+            End If
+        Next j
+    Next i
+End Sub
+
+' ==================================================
+' After matching: set notes for unmatched bank rows
+' ==================================================
+Private Sub AnnotateUnmatchedBankNotes(wsBank As Worksheet)
+    Dim lastBankRow As Long, r As Long, amt As Currency
+    lastBankRow = wsBank.Cells(wsBank.rows.Count, COL_BANK_DATE).End(xlUp).Row
+    
+    For r = 2 To lastBankRow
+        If IsDate(wsBank.Cells(r, COL_BANK_DATE).Value) Then
+            If Len(Trim$(CStr(wsBank.Cells(r, COL_BANK_MATCH).Value))) = 0 Then
+                amt = CCur(Round(CCur(wsBank.Cells(r, COL_BANK_AMT).Value), 2))
+                If Abs(CDbl(amt)) < 1# Then
+                    wsBank.Cells(r, COL_BANK_NOTE).Value = NOTE_BANK_FEE
+                Else
+                    wsBank.Cells(r, COL_BANK_NOTE).Value = NOTE_INFO_REQ
+                End If
+            Else
+                If Trim$(CStr(wsBank.Cells(r, COL_BANK_NOTE).Value)) = vbNullString Then
+                    wsBank.Cells(r, COL_BANK_NOTE).Value = NOTE_MATCH_NO_TIMING
+                ElseIf StrComp(CStr(wsBank.Cells(r, COL_BANK_NOTE).Value), NOTE_TIMING, vbTextCompare) <> 0 Then
+                    wsBank.Cells(r, COL_BANK_NOTE).Value = NOTE_MATCH_NO_TIMING
+                End If
+            End If
+        End If
+    Next r
+End Sub
+
+' ==================================================
+' Build Result sheet from current matches
+' ==================================================
+Private Sub BuildResultSheet(wsBank As Worksheet, wsInv As Worksheet, wsOut As Worksheet)
+    Dim lastBankRow As Long, lastInvRow As Long
+    Dim outRow As Long, r As Long
+    
+    wsOut.Cells.Clear
+    wsOut.Range("A1:E1").Value = Array("Bank ID", "Bank Date", "Bank Amount", "Matched Invoices", "Invoice Total")
+    wsOut.Range("A1:E1").Font.Bold = True
+    outRow = 2
+    
+    lastBankRow = wsBank.Cells(wsBank.rows.Count, COL_BANK_DATE).End(xlUp).Row
+    lastInvRow = wsInv.Cells(wsInv.rows.Count, COL_INV_DATE).End(xlUp).Row
+    
+    For r = 2 To lastBankRow
+        If IsDate(wsBank.Cells(r, COL_BANK_DATE).Value) Then
+            If Len(Trim$(CStr(wsBank.Cells(r, COL_BANK_MATCH).Value))) > 0 Then
+                Dim bankId As String, bankDt As Date, bankAmt As Currency
+                Dim invList As String, sumInv As Currency
+                bankId = "BANK-" & CStr(wsBank.Cells(r, COL_BANK_SEQ).Value)
+                bankDt = DateValue(wsBank.Cells(r, COL_BANK_DATE).Value)
+                bankAmt = CCur(Round(CCur(wsBank.Cells(r, COL_BANK_AMT).Value), 2))
+                
+                BuildInvListAndTotal wsInv, lastInvRow, bankId, invList, sumInv
+                
+                wsOut.Cells(outRow, 1).Value = bankId
+                wsOut.Cells(outRow, 2).Value = bankDt
+                wsOut.Cells(outRow, 3).Value = bankAmt
+                wsOut.Cells(outRow, 4).Value = invList
+                wsOut.Cells(outRow, 5).Value = sumInv
+                outRow = outRow + 1
+            End If
+        End If
+    Next r
+    
+    outRow = outRow + 1
+    
+    Dim umBankHdrRow As Long, umBankListRow As Long, i As Long
+    umBankHdrRow = outRow
+    wsOut.Cells(umBankHdrRow, 1).Value = "Unmatched Bank"
+    wsOut.Cells(umBankHdrRow + 1, 1).Resize(1, 3).Value = Array("Bank ID", "Bank Date", "Bank Amount")
+    umBankListRow = umBankHdrRow + 2
+    
+    For i = 2 To lastBankRow
+        If Len(Trim$(CStr(wsBank.Cells(i, COL_BANK_MATCH).Value))) = 0 _
+           And IsDate(wsBank.Cells(i, COL_BANK_DATE).Value) _
+           And CCur(Round(CCur(wsBank.Cells(i, COL_BANK_AMT).Value), 2)) <> 0 Then
+            wsOut.Cells(umBankListRow, 1).Value = "BANK-" & CStr(wsBank.Cells(i, COL_BANK_SEQ).Value)
+            wsOut.Cells(umBankListRow, 2).Value = DateValue(wsBank.Cells(i, COL_BANK_DATE).Value)
+            wsOut.Cells(umBankListRow, 3).Value = CCur(Round(CCur(wsBank.Cells(i, COL_BANK_AMT).Value), 2))
+            umBankListRow = umBankListRow + 1
+        End If
+    Next i
+    
+    Dim umInvHdrRow As Long, umInvListRow As Long
+    umInvHdrRow = Application.Max(umBankListRow, umBankHdrRow + 2) + 1
+    
+    wsOut.Cells(umInvHdrRow, 1).Value = "Unmatched Invoices"
+    wsOut.Cells(umInvHdrRow + 1, 1).Resize(1, 3).Value = Array("Invoice ID", "Invoice Date", "Invoice Amount")
+    umInvListRow = umInvHdrRow + 2
+    
+    For i = INV_FIRST_DATA_ROW To lastInvRow
+        If Len(Trim$(CStr(wsInv.Cells(i, COL_INV_TAG).Value))) = 0 _
+           And IsDate(wsInv.Cells(i, COL_INV_DATE).Value) Then
+            wsOut.Cells(umInvListRow, 1).Value = "INV-" & CStr(wsInv.Cells(i, COL_INV_SEQ).Value)
+            wsOut.Cells(umInvListRow, 2).Value = DateValue(wsInv.Cells(i, COL_INV_DATE).Value)
+            wsOut.Cells(umInvListRow, 3).Value = CCur(Round(CCur(wsInv.Cells(i, COL_INV_AMT).Value), 2))
+            umInvListRow = umInvListRow + 1
+        End If
+    Next i
+    
+    With wsOut
+        .Columns("A:E").AutoFit
+        .Columns("B").NumberFormat = NF_DATE
+        .Columns("C:E").NumberFormat = NF_ACCT
+        .Cells(1, 1).Resize(1, 5).Font.Bold = True
+    End With
+End Sub
+
+Private Sub BuildInvListAndTotal(wsInv As Worksheet, lastInvRow As Long, tag As String, _
+                                 ByRef invList As String, ByRef sumInv As Currency)
+    Dim r As Long, s As String, a As Currency
+    invList = "": sumInv = 0
+    For r = INV_FIRST_DATA_ROW To lastInvRow
+        If CStr(wsInv.Cells(r, COL_INV_TAG).Value) = tag Then
+            s = "INV-" & CStr(wsInv.Cells(r, COL_INV_SEQ).Value)
+            invList = invList & s & ", "
+            a = CCur(Round(CCur(wsInv.Cells(r, COL_INV_AMT).Value), 2))
+            sumInv = sumInv + a
+        End If
+    Next r
+    If Len(invList) >= 2 Then invList = Left$(invList, Len(invList) - 2)
+End Sub
+
+' ==================================================
+' Candidate building + matching
+' ==================================================
+Private Function TryMatchForDate(wsInv As Worksheet, lastInvRow As Long, bankDt As Date, _
+                                 bankAmt As Currency, sameDayOnly As Boolean, alignedMode As Boolean, _
+                                 ByVal maxK As Long, _
+                                 ByRef picks() As Long, ByRef sumInv As Currency, ByRef invList As String) As Boolean
+    If alignedMode Then
+        Dim cAbs() As InvCandAbs
+        cAbs = GetInvoiceCandidatesAbs(wsInv, lastInvRow, bankDt, sameDayOnly)
+        If Not Not cAbs Then
+            QuickSortAbs cAbs, 0, UBound(cAbs)
+            Dim selIdx() As Long
+            If FindComboUpToK_Aligned(cAbs, Abs(bankAmt), maxK, selIdx) Then
+                BuildOutputFromAbs wsInv, cAbs, selIdx, picks, sumInv, invList
+                If IsClose(sumInv, bankAmt) Then
+                    TryMatchForDate = True
+                Else
+                    Erase picks: invList = "": sumInv = 0
+                End If
+            End If
+        End If
+    Else
+        Dim cS() As InvCand
+        cS = GetInvoiceCandidatesSigned(wsInv, lastInvRow, bankDt, sameDayOnly)
+        If Not Not cS Then
+            QuickSortSignedByAbs cS, 0, UBound(cS)
+            Dim selIdxS() As Long
+            If FindComboUpToK_Signed(cS, bankAmt, maxK, selIdxS) Then
+                BuildOutputFromSigned wsInv, cS, selIdxS, picks, sumInv, invList
+                TryMatchForDate = True
+            End If
+        End If
+    End If
+End Function
+
+Private Function TryMatchWithinRows(wsInv As Worksheet, rowsColl As Collection, bankAmt As Currency, _
+                                    sameDayOnly As Boolean, alignedMode As Boolean, _
+                                    ByVal maxK As Long, _
+                                    ByRef picks() As Long, ByRef sumInv As Currency, ByRef invList As String) As Boolean
+    If rowsColl Is Nothing Or rowsColl.Count = 0 Then Exit Function
+    
+    If alignedMode Then
+        Dim cAbs() As InvCandAbs, n As Long, j As Long, rr As Long, invDt As Date, a As Currency
+        ReDim cAbs(0 To rowsColl.Count - 1)
+        For j = 1 To rowsColl.Count
+            rr = rowsColl(j)
+            a = CCur(Round(CCur(wsInv.Cells(rr, COL_INV_AMT).Value), 2))
+            cAbs(n).Row = rr
+            cAbs(n).AmtAbs = Abs(a)
+            invDt = DateValue(wsInv.Cells(rr, COL_INV_DATE).Value)
+            cAbs(n).Dt = invDt
+            cAbs(n).No = "INV-" & CStr(wsInv.Cells(rr, COL_INV_SEQ).Value)
+            n = n + 1
+        Next j
+        If n = 0 Then Exit Function
+        QuickSortAbs cAbs, 0, UBound(cAbs)
+        Dim selIdx() As Long
+        If FindComboUpToK_Aligned(cAbs, Abs(bankAmt), maxK, selIdx) Then
+            BuildOutputFromAbs wsInv, cAbs, selIdx, picks, sumInv, invList
+            If IsClose(sumInv, bankAmt) Then
+                TryMatchWithinRows = True
+            Else
+                Erase picks: invList = "": sumInv = 0
+            End If
+        End If
+    Else
+        Dim cS() As InvCand, m As Long, j2 As Long, rr2 As Long
+        ReDim cS(0 To rowsColl.Count - 1)
+        For j2 = 1 To rowsColl.Count
+            rr2 = rowsColl(j2)
+            cS(m).Row = rr2
+            cS(m).amt = CCur(Round(CCur(wsInv.Cells(rr2, COL_INV_AMT).Value), 2))
+            cS(m).Dt = DateValue(wsInv.Cells(rr2, COL_INV_DATE).Value)
+            cS(m).No = "INV-" & CStr(wsInv.Cells(rr2, COL_INV_SEQ).Value)
+            m = m + 1
+        Next j2
+        If m = 0 Then Exit Function
+        QuickSortSignedByAbs cS, 0, UBound(cS)
+        Dim selIdxS() As Long
+        If FindComboUpToK_Signed(cS, bankAmt, maxK, selIdxS) Then
+            BuildOutputFromSigned wsInv, cS, selIdxS, picks, sumInv, invList
+            TryMatchWithinRows = True
+        End If
+    End If
+End Function
+
+Private Function GetInvoiceCandidatesAbs(wsInv As Worksheet, lastInvRow As Long, bankDt As Date, sameDayOnly As Boolean) As InvCandAbs()
+    Dim tmp() As InvCandAbs, r As Long, n As Long, invDt As Date, tag As String, a As Currency
+    For r = INV_FIRST_DATA_ROW To lastInvRow
+        tag = CStr(wsInv.Cells(r, COL_INV_TAG).Value)
+        If Len(tag) = 0 Then
+            If IsDate(wsInv.Cells(r, COL_INV_DATE).Value) Then
+                invDt = DateValue(wsInv.Cells(r, COL_INV_DATE).Value)
+                If (sameDayOnly And invDt = bankDt) Or (Not sameDayOnly And IsWithinOneBusinessDay(bankDt, invDt)) Then
+                    n = n + 1
+                    ReDim Preserve tmp(0 To n - 1)
+                    tmp(n - 1).Row = r
+                    tmp(n - 1).Dt = invDt
+                    a = CCur(Round(CCur(wsInv.Cells(r, COL_INV_AMT).Value), 2))
+                    tmp(n - 1).AmtAbs = Abs(a)
+                    tmp(n - 1).No = "INV-" & CStr(wsInv.Cells(r, COL_INV_SEQ).Value)
+                End If
+            End If
+        End If
+    Next r
+    If n > 0 Then GetInvoiceCandidatesAbs = tmp
+End Function
+
+Private Function GetInvoiceCandidatesSigned(wsInv As Worksheet, lastInvRow As Long, bankDt As Date, sameDayOnly As Boolean) As InvCand()
+    Dim tmp() As InvCand, r As Long, n As Long, invDt As Date, tag As String
+    For r = INV_FIRST_DATA_ROW To lastInvRow
+        tag = CStr(wsInv.Cells(r, COL_INV_TAG).Value)
+        If Len(tag) = 0 Then
+            If IsDate(wsInv.Cells(r, COL_INV_DATE).Value) Then
+                invDt = DateValue(wsInv.Cells(r, COL_INV_DATE).Value)
+                If (sameDayOnly And invDt = bankDt) Or (Not sameDayOnly And IsWithinOneBusinessDay(bankDt, invDt)) Then
+                    n = n + 1
+                    ReDim Preserve tmp(0 To n - 1)
+                    tmp(n - 1).Row = r
+                    tmp(n - 1).Dt = invDt
+                    tmp(n - 1).amt = CCur(Round(CCur(wsInv.Cells(r, COL_INV_AMT).Value), 2))
+                    tmp(n - 1).No = "INV-" & CStr(wsInv.Cells(r, COL_INV_SEQ).Value)
+                End If
+            End If
+        End If
+    Next r
+    If n > 0 Then GetInvoiceCandidatesSigned = tmp
+End Function
+
+' ==================================================
+' DFS helpers & sorting
+' ==================================================
+Private Function FindComboUpToK_Aligned(ByRef c() As InvCandAbs, ByVal targetAbs As Currency, _
+                                        ByVal maxK As Long, ByRef picksIdx() As Long) As Boolean
+    Dim k As Long
+    For k = 1 To maxK
+        mAbs = c: mTargetAbs = targetAbs: mMaxK = k
+        mFound = False: mDepth = 0
+        ReDim mPickIdx(1 To k)
+        DFS_Aligned 0, 0, CCur(0)
+        If mFound Then
+            Dim i As Long
+            ReDim picksIdx(1 To mDepth)
+            For i = 1 To mDepth: picksIdx(i) = mPickIdx(i): Next i
+            FindComboUpToK_Aligned = True
+            Exit Function
+        End If
+    Next k
+End Function
+
+Private Sub DFS_Aligned(startIdx As Long, depth As Long, sumSoFar As Currency)
+    Dim i As Long, nextSum As Currency
+    If mFound Then Exit Sub
+    If IsClose(sumSoFar, mTargetAbs) And depth > 0 Then
+        mDepth = depth: mFound = True: Exit Sub
+    End If
+    If depth = mMaxK Then Exit Sub
+    
+    For i = startIdx To UBound(mAbs)
+        nextSum = sumSoFar + mAbs(i).AmtAbs
+        If CDbl(nextSum) <= CDbl(mTargetAbs) + TOL Then
+            mPickIdx(depth + 1) = i
+            DFS_Aligned i + 1, depth + 1, nextSum
+            If mFound Then Exit Sub
+        End If
+    Next i
+End Sub
+
+Private Function FindComboUpToK_Signed(ByRef c() As InvCand, ByVal target As Currency, _
+                                       ByVal maxK As Long, ByRef picksIdx() As Long) As Boolean
+    Dim k As Long
+    For k = 1 To maxK
+        mSigned = c: mTargetSigned = target: mMaxK = k
+        mFoundS = False: mDepthS = 0
+        ReDim mPickIdxS(1 To k)
+        DFS_Signed 0, 0, CCur(0)
+        If mFoundS Then
+            Dim i As Long
+            ReDim picksIdx(1 To mDepthS)
+            For i = 1 To mDepthS: picksIdx(i) = mPickIdxS(i): Next i
+            FindComboUpToK_Signed = True
+            Exit Function
+        End If
+    Next k
+End Function
+
+Private Sub DFS_Signed(startIdx As Long, depth As Long, sumSoFar As Currency)
+    Dim i As Long, nextSum As Currency
+    If mFoundS Then Exit Sub
+    If IsClose(sumSoFar, mTargetSigned) And depth > 0 Then
+        mDepthS = depth: mFoundS = True: Exit Sub
+    End If
+    If depth = mMaxK Then Exit Sub
+    
+    For i = startIdx To UBound(mSigned)
+        nextSum = sumSoFar + mSigned(i).amt
+        mPickIdxS(depth + 1) = i
+        DFS_Signed i + 1, depth + 1, nextSum
+        If mFoundS Then Exit Sub
+    Next i
+End Sub
+
+Private Sub QuickSortAbs(ByRef a() As InvCandAbs, ByVal lo As Long, ByVal hi As Long)
+    Dim i As Long, j As Long, p As Currency, t As InvCandAbs
+    i = lo: j = hi: p = a((lo + hi) \ 2).AmtAbs
+    Do While i <= j
+        Do While a(i).AmtAbs > p: i = i + 1: Loop
+        Do While a(j).AmtAbs < p: j = j - 1: Loop
+        If i <= j Then t = a(i): a(i) = a(j): a(j) = t: i = i + 1: j = j - 1
+    Loop
+    If lo < j Then QuickSortAbs a, lo, j
+    If i < hi Then QuickSortAbs a, i, hi
+End Sub
+
+Private Sub QuickSortSignedByAbs(ByRef a() As InvCand, ByVal lo As Long, ByVal hi As Long)
+    Dim i As Long, j As Long, p As Currency, t As InvCand
+    i = lo: j = hi: p = Abs(a((lo + hi) \ 2).amt)
+    Do While i <= j
+        Do While Abs(a(i).amt) > p: i = i + 1: Loop
+        Do While Abs(a(j).amt) < p: j = j - 1: Loop
+        If i <= j Then t = a(i): a(i) = a(j): a(j) = t: i = i + 1: j = j - 1
+    Loop
+    If lo < j Then QuickSortSignedByAbs a, lo, j
+    If i < hi Then QuickSortSignedByAbs a, i, hi
+End Sub
+
+Private Sub BuildOutputFromAbs(wsInv As Worksheet, ByRef c() As InvCandAbs, ByRef selIdx() As Long, _
+                               ByRef picks() As Long, ByRef sumInv As Currency, ByRef invList As String)
+    Dim j As Long, r As Long, amtSigned As Currency, s As String
+    invList = "": sumInv = 0
+    ReDim picks(LBound(selIdx) To UBound(selIdx))
+    For j = LBound(selIdx) To UBound(selIdx)
+        r = c(selIdx(j)).Row
+        s = c(selIdx(j)).No
+        invList = invList & s & ", "
+        amtSigned = CCur(Round(CCur(wsInv.Cells(r, COL_INV_AMT).Value), 2))
+        sumInv = sumInv + amtSigned
+        picks(j) = r
+    Next j
+    If Len(invList) >= 2 Then invList = Left$(invList, Len(invList) - 2)
+End Sub
+
+Private Sub BuildOutputFromSigned(wsInv As Worksheet, ByRef c() As InvCand, ByRef selIdx() As Long, _
+                                  ByRef picks() As Long, ByRef sumInv As Currency, ByRef invList As String)
+    Dim j As Long
+    invList = "": sumInv = 0
+    ReDim picks(LBound(selIdx) To UBound(selIdx))
+    For j = LBound(selIdx) To UBound(selIdx)
+        invList = invList & c(selIdx(j)).No & ", "
+        sumInv = sumInv + c(selIdx(j)).amt
+        picks(j) = c(selIdx(j)).Row
+    Next j
+    If Len(invList) >= 2 Then invList = Left$(invList, Len(invList) - 2)
+End Sub
+
+' ==================================================
+' Utilities
+' ==================================================
+Private Function IsWithinOneBusinessDay(d1 As Date, d2 As Date) As Boolean
+    Dim diff As Long: diff = DateDiff("d", d1, d2)
+    If Abs(diff) <= 1 Then IsWithinOneBusinessDay = True: Exit Function
+    If Weekday(d1, vbMonday) = 5 And diff = 3 Then IsWithinOneBusinessDay = True: Exit Function ' Fri -> Mon
+    If Weekday(d1, vbMonday) = 1 And diff = -3 Then IsWithinOneBusinessDay = True: Exit Function ' Mon -> Fri
+End Function
+
+Private Function IsClose(a As Currency, b As Currency) As Boolean
+    IsClose = (Abs(CDbl(a) - CDbl(b)) <= TOL)
+End Function
+
+Private Function EnsureSheetAfter(ByVal afterWS As Worksheet, ByVal name As String) As Worksheet
+    On Error Resume Next
+    Set EnsureSheetAfter = ThisWorkbook.Worksheets(name)
+    On Error GoTo 0
+    If EnsureSheetAfter Is Nothing Then
+        Set EnsureSheetAfter = ThisWorkbook.Worksheets.Add(After:=afterWS)
+        EnsureSheetAfter.name = name
+    End If
+End Function
+
+Private Sub ApplyMatch(wsInv As Worksheet, wsBank As Worksheet, bankRow As Long, bankId As String, picks() As Long)
+    Dim j As Long, invList As String
+    Dim timingDiffFound As Boolean
+    timingDiffFound = False
+    invList = ""
+    
+    For j = LBound(picks) To UBound(picks)
+        Dim rInv As Long: rInv = picks(j)
+        wsInv.Cells(rInv, COL_INV_TAG).Value = bankId
+        invList = invList & "INV-" & CStr(wsInv.Cells(rInv, COL_INV_SEQ).Value) & ", "
+        
+        If IsDate(wsInv.Cells(rInv, COL_INV_PERIOD).Value) And IsDate(wsInv.Cells(rInv, COL_INV_DATE).Value) Then
+            Dim dInv As Date, pInv As Date
+            dInv = DateValue(wsInv.Cells(rInv, COL_INV_DATE).Value)
+            pInv = DateValue(wsInv.Cells(rInv, COL_INV_PERIOD).Value)
+            If pInv > dInv Then
+                wsInv.Cells(rInv, COL_INV_NOTE).Value = NOTE_TIMING
+                timingDiffFound = True
+            End If
+        End If
+    Next j
+    
+    If Len(invList) >= 2 Then invList = Left$(invList, Len(invList) - 2)
+    wsBank.Cells(bankRow, COL_BANK_MATCH).Value = invList
+    
+    If timingDiffFound Then
+        wsBank.Cells(bankRow, COL_BANK_NOTE).Value = NOTE_TIMING
+    Else
+        wsBank.Cells(bankRow, COL_BANK_NOTE).Value = NOTE_MATCH_NO_TIMING
+    End If
+End Sub
+
+Private Sub PostFormatSheets(wsBank As Worksheet, wsInv As Worksheet)
+    Dim lastBankRow As Long, lastInvRow As Long
+    lastBankRow = wsBank.Cells(wsBank.rows.Count, COL_BANK_DATE).End(xlUp).Row
+    lastInvRow = wsInv.Cells(wsInv.rows.Count, COL_INV_DATE).End(xlUp).Row
+    
+    wsBank.Columns(COL_BANK_DATE).NumberFormat = NF_DATE
+    wsInv.Columns(COL_INV_DATE).NumberFormat = NF_DATE
+    wsInv.Columns(COL_INV_PERIOD).NumberFormat = NF_DATE
+    
+    wsBank.Columns(COL_BANK_DEBIT).NumberFormat = NF_ACCT
+    wsBank.Columns(COL_BANK_CREDIT).NumberFormat = NF_ACCT
+    wsBank.Columns(COL_BANK_AMT).NumberFormat = NF_ACCT
+    
+    wsInv.Columns(COL_INV_DEBIT).NumberFormat = NF_ACCT
+    wsInv.Columns(COL_INV_CREDIT).NumberFormat = NF_ACCT
+    wsInv.Columns(COL_INV_AMT).NumberFormat = NF_ACCT
+    
+    wsBank.Range("A1").Resize(, COL_BANK_NOTE).EntireColumn.AutoFit
+End Sub
+
+

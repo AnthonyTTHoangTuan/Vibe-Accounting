@@ -1,112 +1,61 @@
-Option Explicit 
+Option Explicit
 
-'================= HELPER FUNCTIONS =======================
-
-' Normalize text for key: trim + collapse spaces + uppercase
-Private Function NormalizeKeyPart(ByVal s As Variant) As String
-    Dim tmp As String
-    tmp = CStr(s)
-    
-    On Error Resume Next
-    ' Application.Trim collapses multiple spaces to single and trims ends
-    tmp = Application.WorksheetFunction.Trim(tmp)
-    On Error GoTo 0
-    
-    NormalizeKeyPart = UCase$(tmp)
-End Function
-
-' Clean numeric value: remove thousand separators, handle text
-Private Function CleanNumber(ByVal v As Variant) As Double
-    Dim s As String
-    s = CStr(v)
-    s = Replace(s, ",", "")
-    s = Trim$(s)
-    If Len(s) = 0 Or Not IsNumeric(s) Then
-        CleanNumber = 0
+Private Function NzD(ByVal v As Variant) As Double
+    If IsError(v) Or IsEmpty(v) Or v = "" Then
+        NzD = 0#
     Else
-        CleanNumber = CDbl(s)
+        NzD = CDbl(v)
     End If
 End Function
 
-'================= MAIN MACRO ==============================
-
-Sub FillNetAndReverted_FlexibleMatch()
-
-    '========================
-    ' CONFIG – EDIT HERE
-    '========================
-    Dim wsCur As Worksheet          ' First tab: destination / accrual sheet
-    Dim wsSrc As Worksheet          ' Second tab: source sheet
+Public Sub FillContraAccounts_SubJournal()
+    Dim ws As Worksheet
+    Set ws = ActiveSheet
     
-    Dim nameCurSheet As String
-    Dim nameSrcSheet As String
+    '=========== CONFIG ===========
+    Const HEADER_ROW As Long = 7          ' L7 is header, data from row 8
     
-    ' If nameCurSheet is blank ⇒ use ActiveSheet
-    nameCurSheet = ""               ' e.g. "CFS"; "" = current sheet
-    nameSrcSheet = "Sheet1"         ' name of the second/source sheet
+    Const COL_JOURNAL As String = "F"     ' Journal column
+    Const COL_ACCOUNT_SRC As String = "E" ' Source Account (E)
+    Const COL_GROUP As String = "K"       ' Group for IF(K8=$K$8,E8,L7)
     
-    '--- FIRST TAB: columns (letters) ---
-    ' 1) Matching group of columns (account, trust, property, etc.)
-    Dim keyColsCurL As Variant
-    keyColsCurL = Array("B", "C")   ' <<<<<< EDIT as needed
+    Const COL_DEBIT As String = "H"       ' Debit
+    Const COL_CREDIT As String = "I"      ' Credit
     
-    ' 2) Transaction text column (e.g. "Net amount", "Reverted amount")
-    Dim colTranCurL As String
-    colTranCurL = "F"               ' <<<<<< EDIT
+    Const COL_ACCOUNT As String = "L"     ' New Account column
+    Const COL_NET As String = "M"         ' Net amount column
+    Const COL_CONTRA As String = "N"      ' Contra column
     
-    ' 3) Amount column to fill
-    Dim colAmtCurL As String
-    colAmtCurL = "S"                ' <<<<<< EDIT
+    Const EPS As Double = 0.005           ' zero-sum tolerance
+    Const SEP As String = "; "            ' separator for contra accounts
+    '=========== END CONFIG =======
     
-    '--- SECOND TAB: columns (letters) ---
-    ' Matching group of columns on second tab (same structure as first)
-    Dim keyColsSrcL As Variant
-    keyColsSrcL = Array("B", "A")   ' <<<<<< EDIT as needed
+    Dim cJ As Long, cAccSrc As Long, cGrp As Long
+    Dim cDeb As Long, cCred As Long, cAccNew As Long, cNet As Long, cContra As Long
     
-    ' Amount column on second tab (source)
-    Dim colAmtSrcL As String
-    colAmtSrcL = "C"                ' <<<<<< EDIT
+    cJ = ws.Columns(COL_JOURNAL).Column
+    cAccSrc = ws.Columns(COL_ACCOUNT_SRC).Column
+    cGrp = ws.Columns(COL_GROUP).Column
     
-    '--- Transaction labels (case-insensitive) ---
-    Dim labelNet As String
-    Dim labelRev As String
+    cDeb = ws.Columns(COL_DEBIT).Column
+    cCred = ws.Columns(COL_CREDIT).Column
     
-    labelNet = "Net amount"
-    labelRev = "Reverted amount"
+    cAccNew = ws.Columns(COL_ACCOUNT).Column
+    cNet = ws.Columns(COL_NET).Column
+    cContra = ws.Columns(COL_CONTRA).Column
     
-    ' Header rows
-    Dim headerRowCur As Long, headerRowSrc As Long
-    headerRowCur = 1
-    headerRowSrc = 1
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.Count, cJ).End(xlUp).Row
+    If lastRow <= HEADER_ROW Then Exit Sub
     
-    ' OPTIONAL: restrict CURRENT SHEET row range
-    Dim processRowFrom As Long
-    Dim processRowTo   As Long
+    Dim firstDataRow As Long
+    firstDataRow = HEADER_ROW + 1           ' = 8
+    Dim nRows As Long
+    nRows = lastRow - firstDataRow + 1
     
-    processRowFrom = 0              ' e.g. 20 → start at row 20; 0 = auto
-    processRowTo   = 0              ' e.g. 80 → end at row 80; 0 = auto
-    
-    '========================
-    ' INTERNAL – DO NOT EDIT
-    '========================
-    Dim colTranCur As Long, colAmtCur As Long
-    Dim colAmtSrc As Long
-    Dim keyColsCur() As Long, keyColsSrc() As Long
-    Dim keyCount As Long, iKey As Long
-    
-    Dim dictPos As Object, dictNeg As Object, dictKeyCur As Object
-    Dim lastRowSrc As Long, lastRowCur As Long
-    Dim firstRow As Long, lastRowToUse As Long
-    Dim labelNetU As String, labelRevU As String
-    
-    Dim scrUpd As Boolean, evt As Boolean, calcMode As XlCalculation
-    Dim t0 As Double
-    Dim baseIdx As Long
-    Dim useAutoStop As Boolean
-    
-    '--- speed settings ---
-    t0 = Timer
-    scrUpd = Application.ScreenUpdating
+    '----- Speed settings -----
+    Dim scrUp As Boolean, evt As Boolean, calcMode As XlCalculation
+    scrUp = Application.ScreenUpdating
     evt = Application.EnableEvents
     calcMode = Application.Calculation
     
@@ -116,249 +65,205 @@ Sub FillNetAndReverted_FlexibleMatch()
     
     On Error GoTo CleanExit
     
-    '---- Validate matching column arrays ----
-    If Not IsArray(keyColsCurL) Or Not IsArray(keyColsSrcL) Then
-        MsgBox "Please set keyColsCurL and keyColsSrcL as arrays of column letters.", vbCritical
-        GoTo CleanExit
-    End If
+    '----- Headers -----
+    ws.Cells(HEADER_ROW, cAccNew).Value = "Account"
+    ws.Cells(HEADER_ROW, cNet).Value = "Net Amount"
+    ws.Cells(HEADER_ROW, cContra).Value = "Contra"
     
-    If UBound(keyColsCurL) - LBound(keyColsCurL) <> UBound(keyColsSrcL) - LBound(keyColsSrcL) Then
-        MsgBox "keyColsCurL and keyColsSrcL must contain the same number of items.", vbCritical
-        GoTo CleanExit
-    End If
+    '===== READ BASE DATA INTO ARRAYS =====
+    Dim rngJ As Range, rngAccSrc As Range, rngGrp As Range
+    Dim rngDeb As Range, rngCred As Range
     
-    keyCount = UBound(keyColsCurL) - LBound(keyColsCurL) + 1
-    If keyCount <= 0 Then
-        MsgBox "You must specify at least one matching column.", vbCritical
-        GoTo CleanExit
-    End If
+    Dim JRN As Variant, accSrc As Variant, grp As Variant
+    Dim debArr As Variant, credArr As Variant
     
-    ReDim keyColsCur(0 To keyCount - 1)
-    ReDim keyColsSrc(0 To keyCount - 1)
+    Set rngJ = ws.Range(ws.Cells(firstDataRow, cJ), ws.Cells(lastRow, cJ))
+    Set rngAccSrc = ws.Range(ws.Cells(firstDataRow, cAccSrc), ws.Cells(lastRow, cAccSrc))
+    Set rngGrp = ws.Range(ws.Cells(firstDataRow, cGrp), ws.Cells(lastRow, cGrp))
+    Set rngDeb = ws.Range(ws.Cells(firstDataRow, cDeb), ws.Cells(lastRow, cDeb))
+    Set rngCred = ws.Range(ws.Cells(firstDataRow, cCred), ws.Cells(lastRow, cCred))
     
-    '---- Pick sheets ----
-    If Len(nameCurSheet) = 0 Then
-        Set wsCur = ActiveSheet
-    Else
-        Set wsCur = ThisWorkbook.Worksheets(nameCurSheet)
-    End If
+    JRN = rngJ.Value2
+    accSrc = rngAccSrc.Value2
+    grp = rngGrp.Value2
+    debArr = rngDeb.Value2
+    credArr = rngCred.Value2
     
-    Set wsSrc = ThisWorkbook.Worksheets(nameSrcSheet)
+    '===== BUILD L (ACCOUNT) & M (NET) IN MEMORY =====
+    Dim ACC As Variant, NET As Variant
+    ReDim ACC(1 To nRows, 1 To 1)
+    ReDim NET(1 To nRows, 1 To 1)
     
-    '---- Convert letters to column numbers (first tab) ----
-    baseIdx = LBound(keyColsCurL)
+    Dim i As Long
     
-    With wsCur
-        For iKey = 0 To keyCount - 1
-            keyColsCur(iKey) = .Columns(CStr(keyColsCurL(baseIdx + iKey))).Column
-        Next iKey
-        
-        colTranCur = .Columns(colTranCurL).Column
-        colAmtCur = .Columns(colAmtCurL).Column
-        
-        ' Last row is determined by transaction text column
-        lastRowCur = .Cells(.Rows.Count, colTranCur).End(xlUp).Row
-    End With
+    'L8 = IF(K8=$K$8,E8,L7), then fill down
+    Dim keyFirst As Variant
+    keyFirst = grp(1, 1) ' corresponds to K8
     
-    '---- Convert letters to column numbers (second tab) ----
-    baseIdx = LBound(keyColsSrcL)
-    
-    With wsSrc
-        For iKey = 0 To keyCount - 1
-            keyColsSrc(iKey) = .Columns(CStr(keyColsSrcL(baseIdx + iKey))).Column
-        Next iKey
-        
-        colAmtSrc = .Columns(colAmtSrcL).Column
-        
-        ' Use first key column as anchor for last row in source
-        lastRowSrc = .Cells(.Rows.Count, keyColsSrc(0)).End(xlUp).Row
-    End With
-    
-    '========================
-    ' BUILD SUMS FROM SECOND TAB
-    '========================
-    Dim srcFirstRow As Long, srcRowCount As Long, r As Long
-    Dim arrAmtSrc As Variant
-    Dim arrKeySrc() As String
-    Dim k As String, part As String
-    Dim amt As Double
-    
-    Set dictPos = CreateObject("Scripting.Dictionary") ' sums of positives
-    Set dictNeg = CreateObject("Scripting.Dictionary") ' sums of negatives
-    dictPos.CompareMode = vbTextCompare
-    dictNeg.CompareMode = vbTextCompare
-    
-    srcFirstRow = headerRowSrc + 1
-    If lastRowSrc < srcFirstRow Then GoTo AfterDict ' no data
-    
-    srcRowCount = lastRowSrc - srcFirstRow + 1
-    ReDim arrKeySrc(1 To srcRowCount)
-    
-    With wsSrc
-        arrAmtSrc = .Range(.Cells(srcFirstRow, colAmtSrc), _
-                           .Cells(lastRowSrc, colAmtSrc)).Value
-    End With
-    
-    For r = 1 To srcRowCount
-        Dim rowSrc As Long
-        rowSrc = srcFirstRow + r - 1
-        
-        ' Build composite key from all matching columns on second tab
-        k = ""
-        For iKey = 0 To keyCount - 1
-            part = NormalizeKeyPart(wsSrc.Cells(rowSrc, keyColsSrc(iKey)).Value)
-            If part <> "" Then
-                If k <> "" Then k = k & "||"
-                k = k & part
-            End If
-        Next iKey
-        
-        arrKeySrc(r) = k
-        
-        amt = CleanNumber(arrAmtSrc(r, 1))
-        
-        If k <> "" And amt <> 0 Then
-            If amt > 0 Then
-                If dictPos.Exists(k) Then
-                    dictPos(k) = dictPos(k) + amt
-                Else
-                    dictPos(k) = amt
-                End If
-            ElseIf amt < 0 Then
-                If dictNeg.Exists(k) Then
-                    dictNeg(k) = dictNeg(k) + amt
-                Else
-                    dictNeg(k) = amt
-                End If
-            End If
-        End If
-    Next r
-    
-AfterDict:
-    '========================
-    ' DETERMINE ROW RANGE ON FIRST TAB
-    '========================
-    useAutoStop = (processRowFrom = 0 And processRowTo = 0)
-    
-    If processRowFrom > 0 Then
-        firstRow = processRowFrom
-    Else
-        firstRow = headerRowCur + 1
-    End If
-    
-    If processRowTo > 0 And processRowTo <= lastRowCur Then
-        lastRowToUse = processRowTo
-    Else
-        lastRowToUse = lastRowCur
-    End If
-    
-    If lastRowToUse < firstRow Then GoTo HighlightUnmatched
-    
-    '========================
-    ' LOAD TRANSACTION TEXT FROM FIRST TAB
-    '========================
-    Dim curRowCount As Long
-    curRowCount = lastRowToUse - firstRow + 1
-    
-    Dim arrTranCur As Variant
-    Dim transTxt As String
-    Dim blankCount As Long
-    Dim primaryVal As String
-    
-    With wsCur
-        arrTranCur = .Range(.Cells(firstRow, colTranCur), _
-                            .Cells(lastRowToUse, colTranCur)).Value
-    End With
-    
-    labelNetU = UCase$(Trim$(labelNet))
-    labelRevU = UCase$(Trim$(labelRev))
-    
-    blankCount = 0
-    Set dictKeyCur = CreateObject("Scripting.Dictionary")
-    dictKeyCur.CompareMode = vbTextCompare
-    
-    '========================
-    ' PROCESS FIRST TAB ROWS
-    '========================
-    For r = 1 To curRowCount
-        Dim rowCur As Long
-        
-        rowCur = firstRow + r - 1
-        primaryVal = CStr(arrTranCur(r, 1))   ' transaction text column
-        
-        ' --- blank logic ---
-        If Trim$(primaryVal) = "" Then
-            If useAutoStop Then
-                blankCount = blankCount + 1
-                If blankCount >= 10 Then Exit For
-            End If
-            GoTo NextRowLoop
+    ACC(1, 1) = accSrc(1, 1)
+    For i = 2 To nRows
+        If grp(i, 1) = keyFirst Then
+            ACC(i, 1) = accSrc(i, 1)
         Else
-            If useAutoStop Then blankCount = 0
+            ACC(i, 1) = ACC(i - 1, 1)
         End If
-        
-        ' Build composite key from matching group on first tab
-        k = ""
-        For iKey = 0 To keyCount - 1
-            part = NormalizeKeyPart(wsCur.Cells(rowCur, keyColsCur(iKey)).Value)
-            If part <> "" Then
-                If k <> "" Then k = k & "||"
-                k = k & part
-            End If
-        Next iKey
-        
-        If k = "" Then GoTo NextRowLoop
-        
-        If Not dictKeyCur.Exists(k) Then dictKeyCur.Add k, True
-        
-        transTxt = UCase$(Trim$(primaryVal))
-        
-        ' ====== ONLY FILL AMOUNT IN NET/REVERTED ROWS ======
-        If transTxt = labelNetU Then
-            ' Net amount row: use sum of positives for this key
-            If dictPos.Exists(k) Then
-                wsCur.Cells(rowCur, colAmtCur).Value = dictPos(k)
-            End If
-        
-        ElseIf transTxt = labelRevU Then
-            ' Reverted amount row: use sum of negatives for this key
-            If dictNeg.Exists(k) Then
-                wsCur.Cells(rowCur, colAmtCur).Value = dictNeg(k)
-            End If
-        End If
-        ' ===================================================
-        
-NextRowLoop:
-    Next r
+    Next i
     
-HighlightUnmatched:
-    '========================
-    ' HIGHLIGHT UNMATCHED KEYS ON SECOND TAB
-    '========================
-    If srcRowCount > 0 Then
-        If dictKeyCur Is Nothing Then
-            Set dictKeyCur = CreateObject("Scripting.Dictionary")
-            dictKeyCur.CompareMode = vbTextCompare
+    'Net = H - I
+    For i = 1 To nRows
+        NET(i, 1) = NzD(debArr(i, 1)) - NzD(credArr(i, 1))
+    Next i
+    
+    ws.Range(ws.Cells(firstDataRow, cAccNew), ws.Cells(lastRow, cAccNew)).Value = ACC
+    ws.Range(ws.Cells(firstDataRow, cNet), ws.Cells(lastRow, cNet)).Value = NET
+    
+    '===== CONTRA ACCOUNT CALCULATION =====
+    Dim contraArr As Variant
+    ReDim contraArr(1 To nRows, 1 To 1)
+    
+    'Journal -> collection of row indexes (1..nRows)
+    Dim dictJ As Object
+    Set dictJ = CreateObject("Scripting.Dictionary")
+    
+    Dim jVal As String
+    Dim colIdx As Collection
+    
+    For i = 1 To nRows
+        jVal = Trim$(CStr(JRN(i, 1)))
+        If jVal <> "" Then
+            If Not dictJ.Exists(jVal) Then
+                Set colIdx = New Collection
+                dictJ.Add jVal, colIdx
+            End If
+            dictJ(jVal).Add i
         End If
+    Next i
+    
+    Dim key As Variant
+    Dim idx() As Long, idxCount As Long
+    Dim pos As Long
+    
+    Dim used() As Boolean
+    Dim iPos As Long, jPos As Long
+    Dim rowIndex As Long
+    Dim selfAcc As String
+    
+    Dim leftCount As Long, t As Long, u As Long
+    Dim leftIdx() As Long, sumLeft As Double
+    Dim dictAcc As Object
+    Dim accVal As String, accKeys As Variant, accCount As Long
+    Dim finalContra As String
+    
+    For Each key In dictJ.Keys
+        Set colIdx = dictJ(key)
+        idxCount = colIdx.Count
+        If idxCount = 0 Then GoTo NextJournal
         
-        For r = 1 To srcRowCount
-            k = arrKeySrc(r)
-            If k <> "" Then
-                If Not dictKeyCur.Exists(k) Then
-                    ' Colour entire row yellow (or change to single cell if you prefer)
-                    wsSrc.Rows(srcFirstRow + r - 1).Interior.Color = vbYellow
-                    ' e.g. only first key column:
-                    ' wsSrc.Cells(srcFirstRow + r - 1, keyColsSrc(0)).Interior.Color = vbYellow
+        ReDim idx(1 To idxCount)
+        For pos = 1 To idxCount
+            idx(pos) = colIdx(pos)          ' array row number
+        Next pos
+        
+        ReDim used(1 To idxCount)
+        
+        '---- Step 1: pairwise matches NET(i)+NET(j)=0 ----
+        For iPos = 1 To idxCount - 1
+            If Not used(iPos) Then
+                For jPos = iPos + 1 To idxCount
+                    If Not used(jPos) Then
+                        If Abs(NzD(NET(idx(iPos), 1)) + NzD(NET(idx(jPos), 1))) <= EPS Then
+                            ' iPos contra jPos
+                            rowIndex = idx(iPos)
+                            contraArr(rowIndex, 1) = Trim$(CStr(ACC(idx(jPos), 1)))
+                            
+                            rowIndex = idx(jPos)
+                            contraArr(rowIndex, 1) = Trim$(CStr(ACC(idx(iPos), 1)))
+                            
+                            used(iPos) = True
+                            used(jPos) = True
+                            Exit For
+                        End If
+                    End If
+                Next jPos
+            End If
+        Next iPos
+        
+        '---- Step 2: leftover rows – treat as one zero-sum group (if they sum to 0) ----
+        leftCount = 0
+        For pos = 1 To idxCount
+            If Not used(pos) Then leftCount = leftCount + 1
+        Next pos
+        
+        If leftCount > 1 Then
+            ReDim leftIdx(1 To leftCount)
+            t = 0
+            sumLeft = 0#
+            For pos = 1 To idxCount
+                If Not used(pos) Then
+                    t = t + 1
+                    leftIdx(t) = idx(pos)
+                    sumLeft = sumLeft + NzD(NET(idx(pos), 1))
+                End If
+            Next pos
+            
+            If Abs(sumLeft) <= EPS Then
+                Set dictAcc = CreateObject("Scripting.Dictionary")
+                
+                'Unique accounts in leftover group
+                For t = 1 To leftCount
+                    rowIndex = leftIdx(t)
+                    accVal = Trim$(CStr(ACC(rowIndex, 1)))
+                    If accVal <> "" Then
+                        If Not dictAcc.Exists(accVal) Then dictAcc.Add accVal, 1
+                    End If
+                Next t
+                
+                accCount = dictAcc.Count
+                If accCount > 0 Then
+                    accKeys = dictAcc.Keys
+                    
+                    For t = 1 To leftCount
+                        rowIndex = leftIdx(t)
+                        selfAcc = Trim$(CStr(ACC(rowIndex, 1)))
+                        finalContra = ""
+                        For u = 0 To accCount - 1
+                            If accKeys(u) <> "" And accKeys(u) <> selfAcc Then
+                                If finalContra <> "" Then finalContra = finalContra & SEP
+                                finalContra = finalContra & accKeys(u)
+                            End If
+                        Next u
+                        contraArr(rowIndex, 1) = finalContra
+                    Next t
                 End If
             End If
-        Next r
-    End If
+        End If
+        
+NextJournal:
+    Next key
+    
+    'Write contra accounts to sheet
+    ws.Range(ws.Cells(firstDataRow, cContra), ws.Cells(lastRow, cContra)).Value = contraArr
+    
+    '===== FINAL CLEAN-UP: clear L,M,N for BB/EB or Net=0 =====
+    Dim kStr As String
+    Dim netVal As Double
+    
+    For i = firstDataRow To lastRow
+        kStr = Trim$(CStr(ws.Cells(i, cGrp).Value))
+        netVal = NzD(ws.Cells(i, cNet).Value)
+        
+        If kStr = "= Beginning Balance =" _
+           Or kStr = "= Ending Balance =" _
+           Or Abs(netVal) <= EPS Then
+           
+            ws.Cells(i, cAccNew).ClearContents
+            ws.Cells(i, cNet).ClearContents
+            ws.Cells(i, cContra).ClearContents
+        End If
+    Next i
     
 CleanExit:
-    ' Restore app settings
-    Application.ScreenUpdating = scrUpd
+    Application.ScreenUpdating = scrUp
     Application.EnableEvents = evt
     Application.Calculation = calcMode
-    
-    'Debug.Print "Elapsed: " & Format(Timer - t0, "0.000") & " seconds"
 End Sub

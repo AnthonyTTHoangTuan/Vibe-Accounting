@@ -1,0 +1,495 @@
+Option Explicit
+
+'========================================================
+' 1. Fill Long Account (N) & Category (O) from COA sheet
+'========================================================
+Public Sub Fill_LongAccount_And_Category_From_COA_Fast()
+    '========================
+    ' CONFIG
+    '========================
+    Const FIRST_GL_ROW As Long = 3   ' start row on GL
+    Const COL_SHORT_GL As String = "G"
+    Const COL_LONG_GL As String = "N"
+    Const COL_CAT_GL As String = "O"
+    
+    Const COA_SHEET_NAME As String = "COA"
+    Const COA_COL_SHORT As String = "D"   ' short code
+    Const COA_COL_LONG As String = "B"    ' long account name
+    Const COA_COL_TYPE As String = "C"    ' Income / Expense / etc.
+    
+    '========================
+    ' VARIABLES
+    '========================
+    Dim wb As Workbook
+    Dim wsGL As Worksheet
+    Dim wsCOA As Worksheet
+    
+    Dim lastRowGL As Long
+    Dim lastRowCOA As Long
+    Dim r As Long, i As Long, nGL As Long
+    
+    Dim dictCOA As Object
+    Dim key As String
+    Dim arrInfo As Variant
+    Dim rawType As String, outCat As String
+    
+    Dim oldScreen As Boolean, oldEvents As Boolean
+    Dim oldCalc As XlCalculation
+    Dim t0 As Double
+    
+    Dim arrShort As Variant   ' GL short codes (column G)
+    Dim arrLong As Variant    ' output long names (column N)
+    Dim arrCat As Variant     ' output PL/BS category (column O)
+    
+    '========================
+    ' SPEED SETTINGS
+    '========================
+    t0 = Timer
+    oldScreen = Application.ScreenUpdating
+    oldCalc = Application.Calculation
+    oldEvents = Application.EnableEvents
+    
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    
+    On Error GoTo ErrHandler
+    
+    Set wb = ActiveWorkbook
+    Set wsGL = ActiveSheet
+    
+    On Error Resume Next
+    Set wsCOA = wb.Worksheets(COA_SHEET_NAME)
+    On Error GoTo ErrHandler
+    
+    If wsCOA Is Nothing Then
+        MsgBox "Cannot find sheet '" & COA_SHEET_NAME & "'.", vbCritical
+        GoTo CleanExit
+    End If
+    
+    '-------------------------
+    ' BUILD COA DICTIONARY
+    ' key = UCase(short code)
+    ' value = Array(LongName, TypeText)
+    '-------------------------
+    Set dictCOA = CreateObject("Scripting.Dictionary")
+    
+    ' use Range with column letter (Cells does not accept "D" etc.)
+    lastRowCOA = wsCOA.Range(COA_COL_SHORT & wsCOA.Rows.Count).End(xlUp).Row
+    
+    For r = 1 To lastRowCOA
+        key = UCase$(Trim$(CStr(wsCOA.Range(COA_COL_SHORT & r).Value)))
+        If key <> "" Then
+            arrInfo = Array( _
+                wsCOA.Range(COA_COL_LONG & r).Value, _
+                wsCOA.Range(COA_COL_TYPE & r).Value _
+            )
+            dictCOA(key) = arrInfo
+        End If
+    Next r
+    
+    '-------------------------
+    ' LOAD GL INTO ARRAYS
+    '-------------------------
+    lastRowGL = wsGL.Cells(wsGL.Rows.Count, COL_SHORT_GL).End(xlUp).Row
+    If lastRowGL < FIRST_GL_ROW Then GoTo CleanExit
+    
+    nGL = lastRowGL - FIRST_GL_ROW + 1
+    
+    ' Read all short codes from column G
+    arrShort = wsGL.Range(COL_SHORT_GL & FIRST_GL_ROW & ":" & COL_SHORT_GL & lastRowGL).Value
+    
+    ' Prepare output arrays for N and O
+    ReDim arrLong(1 To nGL, 1 To 1)
+    ReDim arrCat(1 To nGL, 1 To 1)
+    
+    '-------------------------
+    ' PROCESS IN MEMORY
+    '-------------------------
+    For i = 1 To nGL
+        key = UCase$(Trim$(CStr(arrShort(i, 1))))
+        
+        If key <> "" And dictCOA.Exists(key) Then
+            arrInfo = dictCOA(key)
+            
+            ' Long account name
+            arrLong(i, 1) = arrInfo(0)
+            
+            ' Type -> PL / BS
+            rawType = UCase$(Trim$(CStr(arrInfo(1))))
+            Select Case rawType
+                Case "INCOME", "EXPENSE"
+                    outCat = "PL"
+                Case ""
+                    outCat = ""      ' no type → leave blank
+                Case Else
+                    outCat = "BS"
+            End Select
+            
+            arrCat(i, 1) = outCat
+        Else
+            ' No match in COA – leave blank
+            arrLong(i, 1) = ""
+            arrCat(i, 1) = ""
+        End If
+    Next i
+    
+    '-------------------------
+    ' WRITE BACK TO SHEET (ONCE)
+    '-------------------------
+    wsGL.Range(COL_LONG_GL & FIRST_GL_ROW & ":" & COL_LONG_GL & lastRowGL).Value = arrLong
+    wsGL.Range(COL_CAT_GL & FIRST_GL_ROW & ":" & COL_CAT_GL & lastRowGL).Value = arrCat
+    
+CleanExit:
+    Application.ScreenUpdating = oldScreen
+    Application.Calculation = oldCalc
+    Application.EnableEvents = oldEvents
+    
+    If t0 > 0 Then
+        MsgBox "Filled Columns N and O from COA in " & _
+               Format(Timer - t0, "0.00") & " seconds.", vbInformation
+    End If
+    Exit Sub
+    
+ErrHandler:
+    MsgBox "Error: " & Err.Description, vbCritical
+    Resume CleanExit
+End Sub
+
+
+'========================================================
+' 2. Helper: safe numeric conversion
+'========================================================
+Private Function NzD(ByVal v As Variant) As Double
+    If IsError(v) Or IsEmpty(v) Or v = "" Then
+        NzD = 0#
+    ElseIf IsNumeric(v) Then
+        NzD = CDbl(v)
+    Else
+        NzD = 0#
+    End If
+End Function
+
+
+'========================================================
+' 3. Build YTD TB by Class
+'========================================================
+Public Sub BuildTrialBalance_YTD_ByClass()
+    '========================
+    ' CONFIG – CHANGE HERE
+    '========================
+    Const HEADER_ROW_GL As Long = 2        ' row with "Type / Date / Num / ..."
+    
+    ' >>> INPUT START DATE HERE <<<
+    Const START_DATE As Date = #7/1/2025#  ' e.g. 1 July 2025 (change as needed)
+    
+    Const MEMBERS_EQUITY_ACCOUNT As String = "Members Equity"
+    Const EPS As Double = 0.0005           ' tolerance to treat as zero
+    
+    '========================
+    ' VARIABLES
+    '========================
+    Dim wb As Workbook
+    Dim wsGL As Worksheet
+    Dim wsAgg As Worksheet            ' "Aggregate TB" sheet (class list + output)
+    
+    Dim lastRow As Long
+    Dim firstDataRow As Long
+    Dim LatestDate As Date
+    Dim StartDate As Date
+    Dim EndDate As Date
+    Dim PrevFyEnd As Date
+    
+    Dim colDate As Long
+    Dim colDeb As Long
+    Dim colCre As Long
+    Dim colAcc As Long
+    Dim colCat As Long
+    Dim colClass As Long
+    
+    Dim firstCol As Long, lastCol As Long
+    Dim rngData As Range
+    Dim vData As Variant
+    Dim nRows As Long, nCols As Long
+    Dim idxDate As Long, idxDeb As Long, idxCre As Long
+    Dim idxAcc As Long, idxCat As Long, idxClass As Long
+    
+    Dim dictClassNet As Object   ' class -> (dictionary: account -> balance)
+    Dim dictNet As Object
+    
+    Dim cls As String, acct As String, cat As String
+    Dim dDate As Date
+    Dim dDeb As Double, dCre As Double
+    Dim bal As Double
+    Dim i As Long
+    
+    Dim accKeys As Variant, accKey As Variant
+    
+    ' ordering from Aggregate TB!O9:Oxx
+    Dim lastClassRow As Long
+    Dim r As Long
+    
+    ' output layout
+    Dim startCol As Long          ' column of U9
+    Dim baseCol As Long
+    Dim rowOut As Long
+    Dim lastUsed As Long
+    
+    ' timer & speed settings
+    Dim t0 As Double
+    Dim oldScreen As Boolean, oldEvents As Boolean
+    Dim oldCalc As XlCalculation
+    
+    Dim success As Boolean
+    Dim sh As Worksheet
+    
+    '========================
+    ' START TIMER + SPEED-UP
+    '========================
+    t0 = Timer
+    oldScreen = Application.ScreenUpdating
+    oldCalc = Application.Calculation
+    oldEvents = Application.EnableEvents
+    
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    
+    On Error GoTo ErrHandler
+    
+    ' Use the current sheet as GL sheet
+    Set wsGL = ActiveSheet
+    Set wb = wsGL.Parent
+    
+    ' Map columns using your layout
+    colDate = wsGL.Range("C" & HEADER_ROW_GL).Column      ' Date
+    colDeb = wsGL.Range("K" & HEADER_ROW_GL).Column       ' Debit
+    colCre = wsGL.Range("L" & HEADER_ROW_GL).Column       ' Credit
+    colAcc = wsGL.Range("N" & HEADER_ROW_GL).Column       ' Long Account
+    colCat = wsGL.Range("O" & HEADER_ROW_GL).Column       ' Category (BS / PL)
+    colClass = wsGL.Range("H" & HEADER_ROW_GL).Column     ' Class
+    
+    ' Find last data row using the Date column
+    lastRow = wsGL.Cells(wsGL.Rows.Count, colDate).End(xlUp).Row
+    If lastRow <= HEADER_ROW_GL Then
+        MsgBox "No GL data found under headers on row " & HEADER_ROW_GL & ".", vbExclamation
+        GoTo CleanExit
+    End If
+    
+    firstDataRow = HEADER_ROW_GL + 1
+    
+    ' Latest date in GL
+    With wsGL
+        LatestDate = Application.WorksheetFunction.Max( _
+            .Range(.Cells(firstDataRow, colDate), .Cells(lastRow, colDate)))
+    End With
+    
+    ' Period start & end
+    StartDate = START_DATE
+    EndDate = LatestDate
+    
+    ' PL up to (StartDate - 1) goes to Members Equity
+    PrevFyEnd = DateAdd("d", -1, StartDate)
+    
+    '------------------------- 
+    ' Load GL into array vData
+    '-------------------------
+    firstCol = colDate
+    lastCol = colCat   ' from Date (C) to Category (O)
+    
+    Set rngData = wsGL.Range(wsGL.Cells(firstDataRow, firstCol), _
+                             wsGL.Cells(lastRow, lastCol))
+    vData = rngData.Value            ' 2D variant array
+    
+    nRows = UBound(vData, 1)
+    nCols = UBound(vData, 2)
+    
+    ' index mapping inside array
+    idxDate = colDate - firstCol + 1
+    idxDeb = colDeb - firstCol + 1
+    idxCre = colCre - firstCol + 1
+    idxAcc = colAcc - firstCol + 1
+    idxCat = colCat - firstCol + 1
+    idxClass = colClass - firstCol + 1
+    
+    '========================
+    ' BUILD DICTIONARIES BY CLASS
+    '========================
+    Set dictClassNet = CreateObject("Scripting.Dictionary")
+    
+    For i = 1 To nRows
+        acct = Trim$(CStr(vData(i, idxAcc)))
+        If acct <> "" Then
+            If IsDate(vData(i, idxDate)) Then
+                dDate = CDate(vData(i, idxDate))
+                cls = Trim$(CStr(vData(i, idxClass)))
+                If cls = "" Then cls = "(No Class)"
+                
+                cat = UCase$(Trim$(CStr(vData(i, idxCat))))
+                dDeb = NzD(vData(i, idxDeb))
+                dCre = NzD(vData(i, idxCre))
+                
+                ' Get dictionary for this class
+                If Not dictClassNet.Exists(cls) Then
+                    Set dictNet = CreateObject("Scripting.Dictionary")
+                    dictClassNet.Add cls, dictNet
+                Else
+                    Set dictNet = dictClassNet(cls)
+                End If
+                
+                ' ---------------- BS accounts ----------------
+                If cat = "BS" Then
+                    If dDate <= EndDate Then
+                        If Not dictNet.Exists(acct) Then dictNet(acct) = 0#
+                        dictNet(acct) = dictNet(acct) + (dDeb - dCre)
+                    End If
+                
+                ' ---------------- PL accounts ----------------
+                ElseIf cat = "PL" Or cat = "P&L" Or cat = "P/L" Then
+                    ' 1) All PL up to PrevFyEnd => Members Equity
+                    If dDate <= PrevFyEnd Then
+                        If Not dictNet.Exists(MEMBERS_EQUITY_ACCOUNT) Then
+                            dictNet(MEMBERS_EQUITY_ACCOUNT) = 0#
+                        End If
+                        dictNet(MEMBERS_EQUITY_ACCOUNT) = _
+                            dictNet(MEMBERS_EQUITY_ACCOUNT) + (dDeb - dCre)
+                    
+                    ' 2) PL in current period (StartDate..EndDate) => normal PL accounts
+                    ElseIf dDate >= StartDate And dDate <= EndDate Then
+                        If Not dictNet.Exists(acct) Then dictNet(acct) = 0#
+                        dictNet(acct) = dictNet(acct) + (dDeb - dCre)
+                    End If
+                End If
+            End If
+        End If
+    Next i
+    
+    If dictClassNet.Count = 0 Then
+        MsgBox "No balances found in the specified period.", vbInformation
+        GoTo CleanExit
+    End If
+    
+    '========================
+    ' GET "Aggregate TB" SHEET & CLASS LIST O9:Oxx
+    '========================
+    On Error Resume Next
+    Set wsAgg = wb.Worksheets("Aggregate TB")
+    On Error GoTo ErrHandler
+    
+    If wsAgg Is Nothing Then
+        MsgBox "Sheet 'Aggregate TB' not found.", vbExclamation
+        GoTo CleanExit
+    End If
+    
+    lastClassRow = wsAgg.Cells(wsAgg.Rows.Count, "O").End(xlUp).Row
+    If lastClassRow < 9 Then GoTo CleanExit   ' no class list
+    
+    startCol = wsAgg.Range("U9").Column   ' starting column (U)
+    
+    '========================
+    ' FOR EACH CLASS IN O9:Oxx
+    ' => use its block (3 cols, 4 blank) and only touch those 3 cols
+    '========================
+    For r = 9 To lastClassRow
+        cls = Trim$(CStr(wsAgg.Cells(r, "O").Value))
+        
+        ' baseCol: 1st class at U, next at U+7, then U+14, etc.
+        baseCol = startCol + (r - 9) * 7
+        
+        '---- Clear ONLY the 3 assigned columns (Account, Debit, Credit) from row 9 down
+        With wsAgg
+            lastUsed = Application.WorksheetFunction.Max( _
+                .Cells(.Rows.Count, baseCol).End(xlUp).Row, _
+                .Cells(.Rows.Count, baseCol + 1).End(xlUp).Row, _
+                .Cells(.Rows.Count, baseCol + 2).End(xlUp).Row)
+        End With
+        
+        If lastUsed < 9 Then lastUsed = 9
+        
+        wsAgg.Range(wsAgg.Cells(9, baseCol), _
+                    wsAgg.Cells(lastUsed, baseCol + 2)).ClearContents
+        
+        ' If class name blank or not in GL, skip (leave its 3 columns blank)
+        If cls = "" Then GoTo NextClass
+        If Not dictClassNet.Exists(cls) Then GoTo NextClass
+        
+        '---- Paste TB for this class into those 3 columns
+        Set dictNet = dictClassNet(cls)
+        accKeys = dictNet.Keys
+        
+        rowOut = 9
+        
+        For Each accKey In accKeys
+            bal = dictNet(accKey)
+            If Abs(bal) > EPS Then
+                ' Account name
+                wsAgg.Cells(rowOut, baseCol).Value = accKey
+                ' Debit / Credit
+                If bal > 0 Then
+                    wsAgg.Cells(rowOut, baseCol + 1).Value = bal   ' Debit
+                ElseIf bal < 0 Then
+                    wsAgg.Cells(rowOut, baseCol + 2).Value = -bal  ' Credit
+                End If
+                rowOut = rowOut + 1
+            End If
+        Next accKey
+        
+NextClass:
+    Next r
+    
+    success = True   ' everything finished OK
+    
+CleanExit:
+    ' Rename current sheet as "GL" if everything succeeded
+    If success Then
+        If Not wsGL Is Nothing Then
+            If wsGL.Name <> "GL" Then
+                Dim existsGL As Boolean
+                existsGL = False
+                For Each sh In wb.Worksheets
+                    If sh.Name = "GL" And Not sh Is wsGL Then
+                        existsGL = True
+                        Exit For
+                    End If
+                Next sh
+                
+                If existsGL Then
+                    MsgBox "Sheet 'GL' already exists. Current sheet was not renamed.", _
+                           vbExclamation
+                Else
+                    wsGL.Name = "GL"
+                End If
+            End If
+        End If
+    End If
+    
+    ' restore Excel settings + timer
+    Application.ScreenUpdating = oldScreen
+    Application.Calculation = oldCalc
+    Application.EnableEvents = oldEvents
+    
+    If t0 > 0 And success Then
+        MsgBox "TB by Class pasted to 'Aggregate TB' from U9 (3 cols per class, 4 blank cols between)." & vbCrLf & _
+               "Only classes listed in O9:O" & lastClassRow & " were processed." & vbCrLf & _
+               "Period: " & Format(StartDate, "dd-mmm-yyyy") & " to " & Format(EndDate, "dd-mmm-yyyy") & vbCrLf & _
+               "Elapsed time: " & Format(Timer - t0, "0.00") & " seconds.", _
+               vbInformation
+    End If
+    Exit Sub
+    
+ErrHandler:
+    MsgBox "Error: " & Err.Description, vbCritical
+    Resume CleanExit
+End Sub
+
+
+'========================================================
+' 4. Wrapper: run both steps
+'========================================================
+Public Sub Run_FillCOA_Then_BuildTB()
+    ' 1) First: fill Long Account (N) and Category (O) from COA
+    Call Fill_LongAccount_And_Category_From_COA_Fast
+    
+    ' 2) Then: build TB by class and paste into "Aggregate TB" from U9
+    Call BuildTrialBalance_YTD_ByClass
+End Sub

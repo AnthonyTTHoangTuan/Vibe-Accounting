@@ -1,0 +1,177 @@
+Option Explicit
+
+Sub Split_IIF_By_Class_FixBlocks()
+
+    '==================== CONFIG ====================
+    Const TYPE_COL As String = "A"              ' TRNS / SPL / ENDTRNS
+    Const CLASS_COL As String = "H"             ' CLASS column
+    Const TEMPLATE_LAST_ROW As Long = 3         ' yellow template rows (!TRNS, !SPL, !ENDTRNS)
+    Const FUND_CLASS As String = "CILP 1 Fund"  ' class to split out
+
+    Const OUT_FUND As String = "CILP 1 Fund"
+    Const OUT_OTHER As String = "Other Classes"
+    '================================================
+
+    Dim wsSrc As Worksheet, wsFund As Worksheet, wsOther As Worksheet
+    Dim lastRow As Long, lastCol As Long, c As Long
+    Dim r As Long, startRow As Long, endRow As Long, rr As Long
+    Dim destFundRow As Long, destOtherRow As Long
+
+    Set wsSrc = ActiveSheet
+
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+
+    'Delete output sheets if exist
+    On Error Resume Next
+    Worksheets(OUT_FUND).Delete
+    Worksheets(OUT_OTHER).Delete
+    On Error GoTo 0
+
+    'Create output sheets
+    Set wsFund = Worksheets.Add(After:=wsSrc): wsFund.Name = OUT_FUND
+    Set wsOther = Worksheets.Add(After:=wsFund): wsOther.Name = OUT_OTHER
+
+    'Find last row/col
+    lastRow = wsSrc.Cells(wsSrc.Rows.Count, TYPE_COL).End(xlUp).Row
+    lastCol = wsSrc.Cells(1, wsSrc.Columns.Count).End(xlToLeft).Column
+    If wsSrc.Cells(2, wsSrc.Columns.Count).End(xlToLeft).Column > lastCol Then
+        lastCol = wsSrc.Cells(2, wsSrc.Columns.Count).End(xlToLeft).Column
+    End If
+
+    'Copy template (yellow rows) to both sheets
+    wsSrc.Rows("1:" & TEMPLATE_LAST_ROW).Copy Destination:=wsFund.Rows(1)
+    wsSrc.Rows("1:" & TEMPLATE_LAST_ROW).Copy Destination:=wsOther.Rows(1)
+
+    'Copy column widths
+    For c = 1 To lastCol
+        wsFund.Columns(c).ColumnWidth = wsSrc.Columns(c).ColumnWidth
+        wsOther.Columns(c).ColumnWidth = wsSrc.Columns(c).ColumnWidth
+    Next c
+
+    destFundRow = TEMPLATE_LAST_ROW + 1
+    destOtherRow = TEMPLATE_LAST_ROW + 1
+
+    r = TEMPLATE_LAST_ROW + 1
+
+    Do While r <= lastRow
+
+        If UCase$(Trim$(CStr(wsSrc.Cells(r, TYPE_COL).Value))) = "TRNS" Then
+
+            startRow = r
+            endRow = r
+
+            'Find end of this transaction block:
+            'stop at ENDTRNS if present, otherwise stop before next TRNS (or end of data)
+            Do While endRow < lastRow
+                If UCase$(Trim$(CStr(wsSrc.Cells(endRow + 1, TYPE_COL).Value))) = "TRNS" Then Exit Do
+                endRow = endRow + 1
+                If UCase$(Trim$(CStr(wsSrc.Cells(endRow, TYPE_COL).Value))) = "ENDTRNS" Then Exit Do
+            Loop
+
+            'Write to Fund sheet (rows where CLASS = FUND_CLASS)
+            Call WriteFilteredBlock(wsSrc, wsFund, startRow, endRow, TYPE_COL, CLASS_COL, FUND_CLASS, True, destFundRow, lastCol)
+
+            'Write to Other sheet (rows where CLASS <> FUND_CLASS)
+            Call WriteFilteredBlock(wsSrc, wsOther, startRow, endRow, TYPE_COL, CLASS_COL, FUND_CLASS, False, destOtherRow, lastCol)
+
+            r = endRow + 1
+        Else
+            r = r + 1
+        End If
+
+    Loop
+
+    Application.DisplayAlerts = True
+    Application.ScreenUpdating = True
+
+    MsgBox "Done. Created '" & OUT_FUND & "' and '" & OUT_OTHER & "'.", vbInformation
+
+End Sub
+
+'keepIsFund = True  -> keep rows with CLASS = fund
+'keepIsFund = False -> keep rows with CLASS <> fund
+Private Sub WriteFilteredBlock( _
+    ByVal wsSrc As Worksheet, ByVal wsDst As Worksheet, _
+    ByVal startRow As Long, ByVal endRow As Long, _
+    ByVal TYPE_COL As String, ByVal CLASS_COL As String, _
+    ByVal fundClass As String, ByVal keepIsFund As Boolean, _
+    ByRef dstRow As Long, ByVal lastCol As Long)
+
+    Dim rr As Long, keptCount As Long
+    Dim typ As String, cls As String
+    Dim firstKeptRow As Long
+
+    keptCount = 0
+    firstKeptRow = 0
+
+    'First pass: count kept lines (exclude ENDTRNS lines)
+    For rr = startRow To endRow
+        typ = UCase$(Trim$(CStr(wsSrc.Cells(rr, TYPE_COL).Value)))
+        If typ <> "ENDTRNS" And typ <> "" Then
+            cls = Trim$(CStr(wsSrc.Cells(rr, CLASS_COL).Value))
+            If keepIsFund Then
+                If StrComp(cls, fundClass, vbTextCompare) = 0 Then
+                    keptCount = keptCount + 1
+                    If firstKeptRow = 0 Then firstKeptRow = rr
+                End If
+            Else
+                If StrComp(cls, fundClass, vbTextCompare) <> 0 Then
+                    keptCount = keptCount + 1
+                    If firstKeptRow = 0 Then firstKeptRow = rr
+                End If
+            End If
+        End If
+    Next rr
+
+    If keptCount = 0 Then Exit Sub
+
+    'Second pass: write kept lines as VALUES (no formulas) + formats
+    Dim written As Long
+    written = 0
+
+    For rr = startRow To endRow
+        typ = UCase$(Trim$(CStr(wsSrc.Cells(rr, TYPE_COL).Value)))
+        If typ <> "ENDTRNS" And typ <> "" Then
+
+            cls = Trim$(CStr(wsSrc.Cells(rr, CLASS_COL).Value))
+
+            If (keepIsFund And StrComp(cls, fundClass, vbTextCompare) = 0) _
+               Or ((Not keepIsFund) And StrComp(cls, fundClass, vbTextCompare) <> 0) Then
+
+                'copy VALUES (not formulas)
+                wsDst.Range(wsDst.Cells(dstRow, 1), wsDst.Cells(dstRow, lastCol)).Value = _
+                    wsSrc.Range(wsSrc.Cells(rr, 1), wsSrc.Cells(rr, lastCol)).Value
+
+                'copy FORMATS
+                wsSrc.Range(wsSrc.Cells(rr, 1), wsSrc.Cells(rr, lastCol)).Copy
+                wsDst.Range(wsDst.Cells(dstRow, 1), wsDst.Cells(dstRow, lastCol)).PasteSpecial xlPasteFormats
+                Application.CutCopyMode = False
+
+                written = written + 1
+
+                'force correct row type: first row TRNS, the rest SPL
+                If written = 1 Then
+                    wsDst.Cells(dstRow, 1).Value = "TRNS"
+                Else
+                    wsDst.Cells(dstRow, 1).Value = "SPL"
+                End If
+
+                dstRow = dstRow + 1
+            End If
+        End If
+    Next rr
+
+    'Add ENDTRNS at the end of this block
+    'Copy formats from previous row for consistency
+    wsDst.Rows(dstRow - 1).Copy
+    wsDst.Rows(dstRow).PasteSpecial xlPasteFormats
+    Application.CutCopyMode = False
+
+    wsDst.Cells(dstRow, 1).Value = "ENDTRNS"
+    wsDst.Range(wsDst.Cells(dstRow, 2), wsDst.Cells(dstRow, lastCol)).ClearContents
+
+    dstRow = dstRow + 1
+
+End Sub
+s

@@ -1,0 +1,153 @@
+Option Explicit
+
+'====================  MAIN MACRO  ====================
+
+Public Sub RoundNumbersOnActiveSheet()
+    Dim ws As Worksheet
+    Dim lastRow As Long, lastCol As Long
+    Dim rng As Range
+    Dim arrVal As Variant
+    Dim r As Long, c As Long
+    Dim v As Variant
+    Dim cell As Range
+    Dim oldCalc As XlCalculation
+    Dim oldScreen As Boolean, oldEvents As Boolean
+    Dim isDate As Boolean
+    
+    Set ws = ActiveSheet
+    
+    '---- Detect used range limits (A1 -> last used cell) ----
+    On Error Resume Next
+    lastRow = ws.Cells.Find(What:="*", After:=ws.Range("A1"), _
+                            LookIn:=xlFormulas, LookAt:=xlPart, _
+                            SearchOrder:=xlByRows, _
+                            SearchDirection:=xlPrevious).Row
+    lastCol = ws.Cells.Find(What:="*", After:=ws.Range("A1"), _
+                            LookIn:=xlFormulas, LookAt:=xlPart, _
+                            SearchOrder:=xlByColumns, _
+                            SearchDirection:=xlPrevious).Column
+    On Error GoTo 0
+    
+    If lastRow = 0 Or lastCol = 0 Then Exit Sub  ' no data
+    
+    Set rng = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol))
+    
+    '---- Speed up Excel ----
+    With Application
+        oldScreen = .ScreenUpdating
+        oldEvents = .EnableEvents
+        oldCalc = .Calculation
+        
+        .ScreenUpdating = False
+        .EnableEvents = False
+        .Calculation = xlCalculationManual
+    End With
+    
+    'Take snapshot of values
+    arrVal = rng.Value2
+    
+    '---- Main loop ----
+    For r = 1 To UBound(arrVal, 1)
+        For c = 1 To UBound(arrVal, 2)
+            
+            v = arrVal(r, c)
+            If IsEmpty(v) Then GoTo NextCell
+            
+            'Skip non-numeric and errors
+            If Not IsNumeric(v) Then GoTo NextCell
+            
+            Set cell = rng.Cells(r, c)
+            
+            'Check once if this looks like a date (using cell.NumberFormat)
+            isDate = IsLikelyDate(v, cell.NumberFormat)
+            If isDate Then GoTo NextCell
+            
+            If cell.HasFormula Then
+                'Skip formulas already containing ROUND( )
+                If HasRoundFunction(cell.Formula) Then GoTo NextCell
+                
+                'Formula result is numeric and not a date => wrap with ROUND(,0)
+                cell.Formula = WrapFormulaWithRound(cell.Formula)
+            Else
+                'Hard-coded numeric value => round to integer (keep as value)
+                On Error Resume Next
+                cell.Value = WorksheetFunction.Round(CDbl(v), 0)
+                On Error GoTo 0
+            End If
+            
+NextCell:
+        Next c
+    Next r
+    
+    '---- Restore Excel settings ----
+    With Application
+        .Calculation = oldCalc
+        .EnableEvents = oldEvents
+        .ScreenUpdating = oldScreen
+    End With
+End Sub
+
+'====================  HELPERS  ====================
+
+Private Function WrapFormulaWithRound(ByVal f As String) As String
+    Dim body As String
+    body = f
+    If Left$(body, 1) = "=" Then body = Mid$(body, 2)
+    WrapFormulaWithRound = "=ROUND(" & body & ",0)"
+End Function
+
+Private Function HasRoundFunction(ByVal f As String) As Boolean
+    'Return True if the formula contains ROUND( as a function name
+    Dim s As String
+    Dim pos As Long
+    Dim ch As String
+    
+    s = LCase$(f)
+    pos = InStr(1, s, "round(", vbTextCompare)
+    
+    Do While pos > 0
+        If pos = 2 Then
+            ' "=round(" at start
+            HasRoundFunction = True
+            Exit Function
+        Else
+            ch = Mid$(s, pos - 1, 1)
+            'If char before "round" is NOT a letter, treat it as function ROUND(
+            If ch < "a" Or ch > "z" Then
+                HasRoundFunction = True
+                Exit Function
+            End If
+        End If
+        
+        pos = InStr(pos + 1, s, "round(", vbTextCompare)
+    Loop
+End Function
+
+Private Function IsLikelyDate(ByVal v As Variant, ByVal fmt As Variant) As Boolean
+    'Heuristic to treat numeric + date-style format as a date
+    Dim sFmt As String
+    Dim d As Double
+    
+    On Error GoTo SafeExit
+    
+    If Not IsNumeric(v) Then Exit Function
+    If IsError(fmt) Or IsNull(fmt) Then Exit Function
+    
+    sFmt = LCase$(CStr(fmt))
+    
+    'Look for typical date tokens in the NumberFormat
+    If InStr(sFmt, "yy") > 0 Or _
+       InStr(sFmt, "dd") > 0 Or _
+       InStr(sFmt, "d/m") > 0 Or _
+       InStr(sFmt, "m/d") > 0 Or _
+       InStr(sFmt, "mm/dd") > 0 Then
+        
+        d = CDbl(v)
+        'Restrict to normal Excel date serial range
+        If d > 0 And d < 60000 Then
+            IsLikelyDate = True
+        End If
+    End If
+    
+SafeExit:
+End Function

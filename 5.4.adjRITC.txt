@@ -1,0 +1,91 @@
+Sub Adjust_RITC_AllRowsWithRITC()
+
+    '============================
+    ' CONFIG (change here only)
+    '============================
+    Dim COL_Class As String: COL_Class = "H"
+    Dim COL_Account As String: COL_Account = "G"
+    Dim COL_Amount As String: COL_Amount = "I"
+    Dim COL_Desc As String: COL_Desc = "F"
+    Dim COL_RITC As String: COL_RITC = "J"  'RITC rate now in column J
+    Dim COL_Party As String: COL_Party = "E"   'cột E
+    
+    'Default GST tax rate (10%)
+    Const TAX_RATE As Double = 0.1
+    
+    'Name of GST account
+    Dim GSTAccountName As String: GSTAccountName = "255 · GST payables"
+    '============================
+
+    Dim ws As Worksheet
+    Dim lastRow As Long, r As Long
+    Dim ritcRate As Double
+    Dim net As Double, gst As Double, correctRITC As Double, addBack As Double
+    
+    'Chỉ số cột (numeric) cho Cells()
+    Dim idxClass As Long, idxAccount As Long, idxAmount As Long
+    Dim idxDesc As Long, idxRITC As Long, idxParty As Long
+    
+    Set ws = ActiveSheet
+    
+    idxClass = ws.Columns(COL_Class).Column
+    idxAccount = ws.Columns(COL_Account).Column
+    idxAmount = ws.Columns(COL_Amount).Column
+    idxDesc = ws.Columns(COL_Desc).Column
+    idxRITC = ws.Columns(COL_RITC).Column
+    idxParty = ws.Columns(COL_Party).Column
+    
+    lastRow = ws.Cells(ws.Rows.Count, idxClass).End(xlUp).Row
+    
+    Application.ScreenUpdating = False
+    
+    For r = lastRow To 2 Step -1
+        
+        'Skip rows with no RITC value
+        If ws.Cells(r, idxRITC).Value <> "" Then
+        
+            net = ws.Cells(r, idxAmount).Value
+            ritcRate = ws.Cells(r, idxRITC).Value    'already decimal e.g. 0.55
+            
+            If TAX_RATE <> 0 Then
+            
+                gst = net * TAX_RATE
+                correctRITC = gst * ritcRate
+                addBack = gst - correctRITC
+            
+                If Abs(addBack) > 0.0000001 Then
+                
+                    'Insert 2 lines dưới dòng gốc
+                    ws.Rows(r + 1).Insert
+                    ws.Rows(r + 1).Insert
+                    
+                    'Copy toàn bộ dòng gốc xuống 2 dòng mới
+                    ws.Rows(r).Copy ws.Rows(r + 1)
+                    ws.Rows(r).Copy ws.Rows(r + 2)
+                    
+                    '==== DÒNG EXPENSE ADJUSTMENT (+) – ở r + 1 ====
+                    ws.Cells(r + 1, idxAmount).Value = addBack
+                    ws.Cells(r + 1, idxDesc).Value = "RITC adjustment – Expense"
+                    'Cột E: để trống
+                    ws.Cells(r + 1, idxParty).Value = ""
+                    
+                    '==== DÒNG GST ADJUSTMENT (–) – ở r + 2 ====
+                    ws.Cells(r + 2, idxAccount).Value = GSTAccountName
+                    ws.Cells(r + 2, idxAmount).Value = -addBack
+                    ws.Cells(r + 2, idxDesc).Value = "RITC adjustment – GST"
+                    'Cột E: Australian Taxation Office
+                    ws.Cells(r + 2, idxParty).Value = "Australian Taxation Office"
+                
+                End If
+            
+            End If
+            
+        End If
+    
+    Next r
+    
+    Application.ScreenUpdating = True
+    
+    MsgBox "RITC GST + Expense adjustment completed."
+
+End Sub

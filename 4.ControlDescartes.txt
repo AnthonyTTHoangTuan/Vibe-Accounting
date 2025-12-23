@@ -9,7 +9,7 @@ $outputFile = Join-Path $downloads "MouseCoordinates.txt"
 Write-Host "Monitoring for Ctrl key presses... (Press Ctrl+C to stop)"
 Write-Host "Coordinates will be saved to: $outputFile"
 
-# Add keyboard listener
+# Keyboard listener
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -19,17 +19,13 @@ public class KeyboardListener {
 }
 "@
 
-# Virtual key codes for Ctrl
-$VK_LCONTROL = 0xA2
-$VK_RCONTROL = 0xA3
+# Ctrl key (Left Ctrl only)
+$VK_CONTROL = 0xA2
 
 while ($true) {
     Start-Sleep -Milliseconds 50
 
-    if (
-        ([KeyboardListener]::GetAsyncKeyState($VK_LCONTROL) -band 0x8000) -or
-        ([KeyboardListener]::GetAsyncKeyState($VK_RCONTROL) -band 0x8000)
-    ) {
+    if ([KeyboardListener]::GetAsyncKeyState($VK_CONTROL) -band 0x8000) {
         $pos = [System.Windows.Forms.Cursor]::Position
         $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         $line = "$time : X=$($pos.X), Y=$($pos.Y)"
